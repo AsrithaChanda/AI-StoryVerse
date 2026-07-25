@@ -9,7 +9,7 @@ import { LocalImageAssetStore } from "./images/assets.js";
 import { StoryImagePipeline } from "./images/pipeline.js";
 import { buildImagePrompt, imageCacheKey } from "./images/prompts.js";
 import { DisabledImageGenerator, MockImageGenerator } from "./images/provider.js";
-import { ImageGenerationError, type ImageRequest } from "./images/types.js";
+import { ImageGenerationError, type GeneratedImage, type ImageGenerationInput, type ImageGenerator, type ImageRequest } from "./images/types.js";
 import type { WorldStory } from "./story.js";
 
 const temporaryDirectories: string[] = [];
@@ -174,6 +174,49 @@ describe("story image prompt contracts", () => {
     expect(prompt.prompt).toContain("Saved visual beat: Test Character Two observes the public test signal.");
     expect(prompt.prompt).not.toContain("private-test-marker");
     expect(prompt.prompt).not.toContain("known only to character one");
+  });
+
+  it("uses the complete persisted story cast for image context without a legacy roster cap", async () => {
+    class CapturingImageGenerator implements ImageGenerator {
+      public readonly name = "capturing";
+      public readonly isAvailable = true;
+      public readonly inputs: ImageGenerationInput[] = [];
+      public async generate(input: ImageGenerationInput): Promise<GeneratedImage> {
+        this.inputs.push(input);
+        return {
+          bytes: Buffer.from("<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"1\" height=\"1\"/>"),
+          contentType: "image/svg+xml",
+          provider: "capturing",
+        };
+      }
+    }
+
+    const directory = await mkdtemp(join(tmpdir(), "storyverse-image-tests-"));
+    temporaryDirectories.push(directory);
+    const store = new WorldStore(new DatabaseSync(":memory:"));
+    const world = createTestWorld(store);
+    const original = saveTestStory(store, world.id);
+    const additions = Array.from({ length: 5 }, (_, index) => {
+      const number = index + 3;
+      return {
+        id: `character-${number}`,
+        name: `Test Character ${number}`,
+        role: `Test role ${number}`,
+        visualDescription: `A distinct test visual ${number}.`,
+        personality: `Test trait ${number}.`,
+        goal: `Complete test goal ${number}.`,
+        memories: [`Test memory ${number}.`],
+      };
+    });
+    const story = store.saveWorldStory({ ...original, characters: [...original.characters, ...additions] });
+    const generator = new CapturingImageGenerator();
+    const pipeline = new StoryImagePipeline(store, generator, new LocalImageAssetStore(directory));
+
+    const image = await pipeline.generate(chapterRequest(world.id));
+
+    expect(generator.inputs).toHaveLength(1);
+    for (const character of story.characters) expect(generator.inputs[0]?.prompt).toContain(character.name);
+    expect(image.characterIds).toEqual(story.characters.map((character) => character.id));
   });
 });
 

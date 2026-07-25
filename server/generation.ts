@@ -3,6 +3,18 @@ import { extractOutputText, type OpenAIResponsePayload } from "./openai-response
 
 type GeneratedWorld = Pick<World, "openingScene" | "characters" | "source">;
 
+function normalizeBlueprintCharacters(value: unknown): World["characters"] | null {
+  if (!Array.isArray(value) || value.length === 0) return null;
+  const characters: World["characters"] = [];
+  for (const raw of value) {
+    if (!raw || typeof raw !== "object") return null;
+    const candidate = raw as Partial<World["characters"][number]>;
+    if (![candidate.name, candidate.role, candidate.trait].every((field) => typeof field === "string" && field.trim().length > 0)) return null;
+    characters.push({ name: candidate.name!.trim(), role: candidate.role!.trim(), trait: candidate.trait!.trim() });
+  }
+  return characters;
+}
+
 function fallback(input: CreateWorldInput): GeneratedWorld {
   return {
     // Do not invent a canned cast for a user-created world. If generation is
@@ -22,8 +34,8 @@ export async function generateWorld(input: CreateWorldInput): Promise<GeneratedW
       headers: { "Content-Type": "application/json", Authorization: `Bearer ${key}` },
       body: JSON.stringify({
         model: process.env.OPENAI_MODEL || "gpt-4.1-mini",
-        instructions: "You create concise, original interactive story worlds. Never imitate a named author or existing franchise. Return only JSON matching the requested schema.",
-        input: `Create an original world from this brief. Title: ${input.title}. Genre: ${input.genre}. Premise: ${input.premise}. Creator note: ${input.creatorPrompt}.`,
+        instructions: "You create concise, original interactive story worlds. Never imitate a named author or existing franchise. Return only JSON matching the requested schema. Create a persistent cast appropriate to the brief; do not limit it to a fixed number of characters.",
+        input: `Create an original world from this brief. Title: ${input.title}. Genre: ${input.genre}. Premise: ${input.premise}. Creator note: ${input.creatorPrompt}. Include every core character this world needs, each with a concise role and trait.`,
         text: {
           format: {
             type: "json_schema", name: "world_blueprint", strict: true,
@@ -32,7 +44,7 @@ export async function generateWorld(input: CreateWorldInput): Promise<GeneratedW
               properties: {
                 openingScene: { type: "string", minLength: 80, maxLength: 600 },
                 characters: {
-                  type: "array", minItems: 3, maxItems: 3,
+                  type: "array", minItems: 1,
                   items: {
                     type: "object", additionalProperties: false, required: ["name", "role", "trait"],
                     properties: { name: { type: "string" }, role: { type: "string" }, trait: { type: "string" } },
@@ -47,8 +59,9 @@ export async function generateWorld(input: CreateWorldInput): Promise<GeneratedW
     if (!response.ok) return fallback(input);
     const payload = await response.json() as OpenAIResponsePayload;
     const parsed = JSON.parse(extractOutputText(payload) ?? "") as Omit<GeneratedWorld, "source">;
-    if (!parsed.openingScene || !Array.isArray(parsed.characters) || parsed.characters.length !== 3) return fallback(input);
-    return { openingScene: parsed.openingScene, characters: parsed.characters, source: "openai" };
+    const characters = normalizeBlueprintCharacters(parsed.characters);
+    if (!parsed.openingScene || !characters) return fallback(input);
+    return { openingScene: parsed.openingScene, characters, source: "openai" };
   } catch {
     return fallback(input);
   }

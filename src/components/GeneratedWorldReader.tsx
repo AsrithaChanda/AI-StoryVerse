@@ -1,7 +1,7 @@
 import { Fragment, useEffect, useMemo, useRef, useState } from "react";
 import type { StoryBeat, StoryChapter, WorldStory } from "../api/story";
-import { bootstrapStory } from "../api/story";
-import { streamCharacterPerspective, streamCommandStory, streamNextChapter, type StoryGenerationStage as StoryGenerationPhase } from "../api/story-stream";
+import { addUpcomingDirection, bootstrapStory } from "../api/story";
+import { streamCharacterPerspective, streamNextChapter, streamReviseChapter, type StoryGenerationStage as StoryGenerationPhase } from "../api/story-stream";
 import type { World } from "../api/worlds";
 import { generateSceneImage, loadSceneImage } from "../images/api";
 import { prepareChapterImages } from "../images/chapter-preparation";
@@ -10,12 +10,14 @@ import ChapterBgm from "./ChapterBgm";
 import ChapterNarration from "./ChapterNarration";
 import type { AudioPlan } from "../audio/chapter-audio";
 import SceneImage from "./SceneImage";
+import StoryAuthorControls from "./StoryAuthorControls";
 import StoryGenerationStage from "./StoryGenerationStage";
+import WorldCast from "./WorldCast";
 import { buildStoryFlow } from "../story-layout";
 
 type IllustrationProgress = { number: number; completed: number; total: number };
 type PerspectiveLoading = { characterId: string; characterName: string };
-type StreamingGeneration = { kind: "chapter" | "perspective"; number?: number; characterName?: string; narration: string; phase: StoryGenerationPhase };
+type StreamingGeneration = { kind: "chapter" | "perspective" | "revision"; number?: number; characterName?: string; narration: string; phase: StoryGenerationPhase };
 const MIN_PERSPECTIVE_LOADING_MS = 450;
 const wait = (milliseconds: number) => new Promise<void>((resolve) => globalThis.setTimeout(resolve, milliseconds));
 
@@ -26,7 +28,6 @@ export default function GeneratedWorldReader({ world, close }: { world: World; c
   const [viewNarration, setViewNarration] = useState("");
   const [viewBeats, setViewBeats] = useState<StoryBeat[]>([]);
   const [storedImages, setStoredImages] = useState<Record<string, StoryImage | null>>({});
-  const [command, setCommand] = useState("");
   const [busy, setBusy] = useState(true);
   const [error, setError] = useState<string>();
   const [streamingGeneration, setStreamingGeneration] = useState<StreamingGeneration | null>(null);
@@ -54,6 +55,7 @@ export default function GeneratedWorldReader({ world, close }: { world: World; c
   const chapter = story?.chapters.find((candidate) => candidate.id === selectedChapterId) ?? story?.chapters.at(-1);
   const chapterIndex = chapter && story ? story.chapters.findIndex((candidate) => candidate.id === chapter.id) : -1;
   const isLatestChapter = Boolean(story && chapterIndex === story.chapters.length - 1);
+  const chapterArtifactKey = chapter ? `${chapter.id}-r${chapter.revision ?? 1}` : "chapter";
   const moment = activeCharacter ? "perspective_scene" as const : "chapter_scene" as const;
   const readerLabel = useMemo(() => activeCharacter ? story?.characters.find((character) => character.id === activeCharacter)?.name ?? "Character" : "Narrator", [activeCharacter, story]);
   const storyFlow = useMemo(() => buildStoryFlow(viewNarration, viewBeats), [viewNarration, viewBeats]);
@@ -136,21 +138,21 @@ export default function GeneratedWorldReader({ world, close }: { world: World; c
     }
   };
 
-  const advance = async (authorCommand?: string) => {
+  const streamHandlers = (kind: StreamingGeneration["kind"]) => ({
+    onPhase: (phase: StoryGenerationPhase) => setStreamingGeneration((current) => current?.kind === kind ? { ...current, phase } : current),
+    onNarration: (text: string) => setStreamingGeneration((current) => current?.kind === kind ? { ...current, narration: `${current.narration}${text}` } : current),
+  });
+
+  const advance = async () => {
     if (!story || busy || illustrationProgress || !isLatestChapter) return;
     setBusy(true); setError(undefined);
     const requestedNumber = (story.chapters.at(-1)?.number ?? 0) + 1;
     setStreamingGeneration({ kind: "chapter", number: requestedNumber, narration: "", phase: "writing" });
     try {
-      const handlers = {
-        onPhase: (phase: StoryGenerationPhase) => setStreamingGeneration((current) => current?.kind === "chapter" ? { ...current, phase } : current),
-        onNarration: (text: string) => setStreamingGeneration((current) => current?.kind === "chapter" ? { ...current, narration: `${current.narration}${text}` } : current),
-      };
-      const result = authorCommand ? await streamCommandStory(world.id, authorCommand, handlers) : await streamNextChapter(world.id, handlers);
+      const result = await streamNextChapter(world.id, streamHandlers("chapter"));
       const next = result.story.chapters.at(-1);
       if (!next) throw new Error("The story engine returned no new chapter.");
       updateFromStory(result.story);
-      setCommand("");
       const taskId = ++illustrationTask.current;
       setIllustrationProgress({ number: next.number, completed: 0, total: next.beats.length });
       void prepareChapterImages({
@@ -168,6 +170,50 @@ export default function GeneratedWorldReader({ world, close }: { world: World; c
     }
   };
 
+  const reviseCurrentChapter = async (prompt: string) => {
+    if (!story || !chapter || busy || illustrationProgress || !isLatestChapter) return;
+    illustrationTask.current += 1;
+    setIllustrationProgress(null);
+    setBusy(true); setError(undefined); setAudioPlan(null);
+    setStreamingGeneration({ kind: "revision", number: chapter.number, narration: "", phase: "writing" });
+    try {
+      const result = await streamReviseChapter(world.id, prompt, streamHandlers("revision"));
+      if (!result.chapter || result.chapter.id !== chapter.id) throw new Error("The story engine did not return a revision for this chapter.");
+      setStory(result.story);
+      // A revision owns new visual beats. Clear the in-memory map so an old
+      // illustration can never briefly stand in for the new chapter.
+      setStoredImages({});
+      showNarratorChapter(result.chapter);
+      const taskId = ++illustrationTask.current;
+      setIllustrationProgress({ number: result.chapter.number, completed: 0, total: result.chapter.beats.length });
+      void prepareChapterImages({
+        worldId: world.id,
+        beats: result.chapter.beats,
+        generate: generateSceneImage,
+        onImage: (beat, image) => setStoredImages((current) => ({ ...current, [beat.id]: image })),
+        onProgress: (completed, total) => { if (illustrationTask.current === taskId) setIllustrationProgress({ number: result.chapter.number, completed, total }); },
+      }).finally(() => { if (illustrationTask.current === taskId) setIllustrationProgress(null); });
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : "This chapter could not be revised.");
+    } finally {
+      setStreamingGeneration((current) => current?.kind === "revision" ? null : current);
+      setBusy(false);
+    }
+  };
+
+  const addDirection = async (direction: string) => {
+    if (!story || busy || !isLatestChapter) return;
+    setBusy(true); setError(undefined);
+    try {
+      const result = await addUpcomingDirection(world.id, direction);
+      setStory(result.story);
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : "The upcoming direction could not be saved.");
+    } finally {
+      setBusy(false);
+    }
+  };
+
   const retryBootstrap = () => {
     setBusy(true); setError(undefined);
     void bootstrapStory(world.id).then(({ story: next }) => updateFromStory(next))
@@ -179,7 +225,7 @@ export default function GeneratedWorldReader({ world, close }: { world: World; c
     <header className="reader-header"><button className="brand" type="button" onClick={close}><span className="mark">SV</span> WORLD ATLAS</button><span className="timeline-pill violet">{world.genre}</span></header>
     {busy && !story ? <div className="story-boot"><p className="eyebrow">STORY ENGINE</p><h1>Writing Chapter 1…</h1><p>Building a persistent cast, opening chapter, and image beats for {world.title}.</p></div>
       : error && !story ? <div className="story-boot"><h1>The chapter is waiting.</h1><p>{error}</p><button type="button" className="enter-button" onClick={retryBootstrap}>Try again</button></div>
-        : streamingGeneration?.kind === "chapter" ? <StoryGenerationStage kind="chapter" number={streamingGeneration.number} narration={streamingGeneration.narration} phase={streamingGeneration.phase} />
+        : streamingGeneration?.kind === "chapter" || streamingGeneration?.kind === "revision" ? <StoryGenerationStage kind={streamingGeneration.kind} number={streamingGeneration.number} narration={streamingGeneration.narration} phase={streamingGeneration.phase} />
           : story && chapter ? <div className="generated-grid"><section className="generated-story">
             {story.chapters.length > 1 && <nav className="chapter-archive" aria-label="Chapter history">
               <button type="button" onClick={() => showNarratorChapter(story.chapters[chapterIndex - 1])} disabled={chapterIndex <= 0}>← Previous</button>
@@ -196,18 +242,20 @@ export default function GeneratedWorldReader({ world, close }: { world: World; c
             </div>
             {perspectiveLoading && <PerspectiveLoadingNotice characterName={perspectiveLoading.characterName} />}
             {showingPerspectiveDraft && streamingGeneration ? <StoryGenerationStage kind="perspective" characterName={streamingGeneration.characterName} narration={streamingGeneration.narration} phase={streamingGeneration.phase} /> : <>
-              <ChapterBgm key={`bgm-${chapter.id}-${activeCharacter ?? "canonical"}`} worldId={world.id} chapterId={chapter.id} protagonistId={activeCharacter ?? undefined} chapterText={`${chapter.title}\n${viewNarration}`} perspective={activeCharacter ? `${readerLabel}'s POV` : "Canonical world view"} onPlan={setAudioPlan} />
-              <ChapterNarration key={`narration-${chapter.id}-${activeCharacter ?? "canonical"}`} worldId={world.id} chapterId={chapter.id} protagonistId={activeCharacter ?? undefined} plan={audioPlan} />
+              <ChapterBgm key={`bgm-${chapterArtifactKey}-${activeCharacter ?? "canonical"}`} worldId={world.id} chapterId={chapter.id} protagonistId={activeCharacter ?? undefined} chapterText={`${chapter.title}\n${viewNarration}`} perspective={activeCharacter ? `${readerLabel}'s POV` : "Canonical world view"} onPlan={setAudioPlan} />
+              <ChapterNarration key={`narration-${chapterArtifactKey}-${activeCharacter ?? "canonical"}`} worldId={world.id} chapterId={chapter.id} protagonistId={activeCharacter ?? undefined} plan={audioPlan} />
               {illustrationProgress?.number === chapter.number && <div className="illustration-progress" role="status" aria-live="polite"><span>ILLUSTRATING IN BACKGROUND</span><b>{illustrationProgress.completed} of {illustrationProgress.total} chapter scenes saved</b><i><em style={{ width: `${(illustrationProgress.completed / Math.max(1, illustrationProgress.total)) * 100}%` }} /></i></div>}
               <div className="chapter-flow">{storyFlow.map((item, paragraphIndex) => <Fragment key={`${paragraphIndex}-${item.paragraph.slice(0, 32)}`}><p className="scene-prose">{item.paragraph}</p>{item.beats.map((beat) => <div className="story-beat" key={beat.id}><SceneImage image={storedImages[beat.id]} worldId={world.id} sceneId={beat.id} moment={moment} protagonistId={activeCharacter ?? undefined} title={beat.caption} description={beat.description} loadImage={isLatestChapter && !illustrationProgress ? loadImage : undefined} preparing={Boolean(illustrationProgress)} retryImage={(request) => generateSceneImage(request, true)} /></div>)}</Fragment>)}</div>
             </>}
-            {isLatestChapter ? <><div className="author-command"><label htmlFor="story-command">Change the story</label><textarea id="story-command" value={command} maxLength={1000} onChange={(event) => setCommand(event.target.value)} placeholder="For example: introduce a storm that separates the allies, but keep the mentor alive." /><button type="button" disabled={busy || Boolean(illustrationProgress) || command.trim().length < 3} onClick={() => void advance(command.trim())}>Apply command →</button></div><button className="next-chapter" type="button" disabled={busy || Boolean(illustrationProgress)} onClick={() => void advance()}>{illustrationProgress ? "Illustrating chapter…" : "Generate next chapter →"}</button></> : <div className="archive-note"><span>ARCHIVED CHAPTER</span><p>This chapter and its illustrations are preserved. Return to the latest chapter to continue the world’s timeline.</p><button type="button" onClick={() => showNarratorChapter(story.chapters.at(-1)!)}>Return to latest chapter →</button></div>}
+            {isLatestChapter ? <StoryAuthorControls upcomingDirections={story.upcomingDirections ?? []} busy={busy || Boolean(illustrationProgress)} onReviseCurrent={(prompt) => void reviseCurrentChapter(prompt)} onAddDirection={(direction) => void addDirection(direction)} onGenerateNext={() => void advance()} /> : <div className="archive-note"><span>ARCHIVED CHAPTER</span><p>This chapter and its illustrations are preserved. Return to the latest chapter to continue the world’s timeline.</p><button type="button" onClick={() => showNarratorChapter(story.chapters.at(-1)!)}>Return to latest chapter →</button></div>}
             {error && <p className="story-error" role="status">{error}</p>}
-          </section><aside className="story-cast"><p className="panel-label">PERSISTENT CAST</p>{story.characters.map((character) => {
-            const isLoading = character.id === perspectiveLoading?.characterId;
-            const className = [character.id === activeCharacter ? "active" : "", isLoading ? "loading" : ""].filter(Boolean).join(" ");
-            return <button type="button" className={className} key={character.id} disabled={busy || !isLatestChapter} aria-busy={isLoading || undefined} aria-pressed={character.id === activeCharacter} aria-label={isLoading ? `Opening ${character.name}'s perspective` : `View ${character.name}'s perspective`} onClick={() => void chooseCharacter(character.id)}><b>{character.name}</b><span>{isLoading ? "OPENING PERSPECTIVE…" : character.role}</span><small>{character.personality}</small></button>;
-          })}<p className="cast-note">{isLatestChapter ? "Choose a character to see the current chapter through only their memories, goals, and observations." : "Character perspectives are available on the current chapter; this archived chapter keeps its original narration and illustrations."}</p></aside></div>
+          </section><WorldCast
+            characters={story.characters}
+            activeCharacterId={activeCharacter}
+            loadingCharacterId={perspectiveLoading?.characterId}
+            disabled={busy || !isLatestChapter}
+            onSelect={(characterId) => void chooseCharacter(characterId)}
+          /></div>
             : <div className="story-boot"><p className="eyebrow">CHAPTER 1 IS NOT READY</p><h1>This world is waiting for its first scene.</h1><p>The story engine did not receive a usable chapter yet. Retry once the model connection is available; your world data is preserved.</p><button type="button" className="enter-button" onClick={retryBootstrap} disabled={busy}>{busy ? "Writing Chapter 1…" : "Generate Chapter 1 →"}</button>{error && <p className="story-error" role="status">{error}</p>}</div>}
   </main>;
 }

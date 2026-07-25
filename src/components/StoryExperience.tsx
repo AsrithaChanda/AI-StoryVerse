@@ -33,7 +33,7 @@ const capabilityCards = [
   {
     index: "03",
     title: "Direct what happens next",
-    detail: "Use an author command to introduce a change, then generate the next chapter while carrying the saved world and cast forward.",
+    detail: "Queue a direction or introduce new characters, then generate the next chapter while carrying the saved world and full cast forward.",
     accent: "blue",
   },
 ] as const;

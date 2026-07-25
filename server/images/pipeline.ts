@@ -23,7 +23,12 @@ export class StoryImagePipeline {
     const canonical = { worldId: request.worldId, sceneId: request.sceneId, moment: request.moment, branchId: request.branchId, protagonistId: request.protagonistId };
     const cacheKey = imageCacheKey(canonical);
     logInfo("image.generation.requested", { worldId: canonical.worldId, sceneId: canonical.sceneId, moment: canonical.moment, cacheKey: cacheKey.slice(0, 12) });
-    const prompt = buildImagePrompt(world, canonical, this.store.visualBeat(world.id, canonical.sceneId));
+    const prompt = buildImagePrompt(
+      world,
+      canonical,
+      this.store.visualBeat(world.id, canonical.sceneId),
+      this.store.getWorldStory(world.id),
+    );
     const reserved = this.store.reserveStoryImage({
       cacheKey, worldId: canonical.worldId, branchId: canonical.branchId, sceneId: canonical.sceneId,
       protagonistId: canonical.protagonistId, characterIds: prompt.characterIds, promptVersion: IMAGE_PROMPT_VERSION,

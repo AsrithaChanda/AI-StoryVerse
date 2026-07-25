@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { DatabaseSync } from "node:sqlite";
 import type { NewStoryImage, StoredStoryImage } from "./images/types.js";
-import type { WorldStory } from "./story.js";
+import { MAX_UPCOMING_DIRECTIONS, type WorldStory } from "./story.js";
 
 export type World = {
   id: string;
@@ -170,7 +170,8 @@ export class WorldStore {
   public saveWorldStory(story: WorldStory): WorldStory {
     const now = new Date().toISOString();
     const existing = this.getWorldStory(story.worldId);
-    const persisted = { ...story, createdAt: existing?.createdAt ?? story.createdAt ?? now, updatedAt: now };
+    const normalized = migrateLegacyChapterSceneIds(story);
+    const persisted = { ...normalized, createdAt: existing?.createdAt ?? normalized.createdAt ?? now, updatedAt: now };
     this.db.prepare(`INSERT INTO world_stories (world_id, story_json, created_at, updated_at) VALUES (?, ?, ?, ?)
       ON CONFLICT(world_id) DO UPDATE SET story_json = excluded.story_json, updated_at = excluded.updated_at`)
       .run(persisted.worldId, JSON.stringify(persisted), persisted.createdAt, persisted.updatedAt);
@@ -298,24 +299,30 @@ function migrateLegacyChapterSceneIds(story: WorldStory): WorldStory {
   const worldState = story.worldState.replace(/\s+Author direction:[\s\S]*$/i, "").trim();
   if (worldState !== story.worldState) changed = true;
   const chapterIdMap = new Map<string, string>();
+  const chapterRevisionMap = new Map<string, number>();
   const chapters = story.chapters.map((chapter) => {
     let chapterChanged = false;
+    const revision = typeof chapter.revision === "number" && Number.isInteger(chapter.revision) && chapter.revision >= 1 ? chapter.revision : 1;
+    const id = `chapter-${chapter.number}`;
+    const beatPrefix = revision > 1 ? `${id}-r${revision}` : id;
     const beats = chapter.beats.map((beat, index) => {
-      const id = `chapter-${chapter.number}-beat-${index + 1}`;
-      if (beat.id === id) return beat;
+      const beatId = `${beatPrefix}-beat-${index + 1}`;
+      if (beat.id === beatId) return beat;
       changed = true;
       chapterChanged = true;
-      return { ...beat, id };
+      return { ...beat, id: beatId };
     });
-    const id = `chapter-${chapter.number}`;
     chapterIdMap.set(chapter.id, id);
-    if (chapter.id !== id) { changed = true; chapterChanged = true; }
-    return chapterChanged ? { ...chapter, id, beats } : chapter;
+    chapterRevisionMap.set(id, revision);
+    if (chapter.id !== id || chapter.revision !== revision) { changed = true; chapterChanged = true; }
+    return chapterChanged ? { ...chapter, id, revision, beats } : chapter;
   });
   const perspectives = story.perspectives.map((perspective) => {
     const chapterId = chapterIdMap.get(perspective.chapterId) ?? perspective.chapterId;
+    const revision = chapterRevisionMap.get(chapterId) ?? 1;
+    const beatPrefix = revision > 1 ? `${chapterId}-r${revision}-${perspective.characterId}` : `${chapterId}-${perspective.characterId}`;
     const beats = perspective.beats.map((beat, index) => {
-      const id = `${chapterId}-${perspective.characterId}-beat-${index + 1}`;
+      const id = `${beatPrefix}-beat-${index + 1}`;
       if (beat.id === id) return beat;
       changed = true;
       return { ...beat, id };
@@ -324,7 +331,30 @@ function migrateLegacyChapterSceneIds(story: WorldStory): WorldStory {
     changed = true;
     return { ...perspective, chapterId, beats };
   });
-  return changed ? { ...story, chapters, perspectives, worldState } : story;
+  const upcomingDirections = normalizeUpcomingDirections(story.upcomingDirections);
+  if (!sameStringArray(story.upcomingDirections, upcomingDirections)) changed = true;
+  return changed ? { ...story, chapters, perspectives, worldState, upcomingDirections } : story;
+}
+
+function normalizeUpcomingDirections(value: unknown): string[] {
+  if (!Array.isArray(value)) return [];
+  const seen = new Set<string>();
+  const directions: string[] = [];
+  for (const entry of value) {
+    if (typeof entry !== "string") continue;
+    const direction = entry.trim().replace(/\s+/g, " ");
+    if (direction.length < 3 || direction.length > 1000) continue;
+    const identity = direction.toLocaleLowerCase();
+    if (seen.has(identity)) continue;
+    seen.add(identity);
+    directions.push(direction);
+    if (directions.length === MAX_UPCOMING_DIRECTIONS) break;
+  }
+  return directions;
+}
+
+function sameStringArray(value: unknown, expected: string[]): value is string[] {
+  return Array.isArray(value) && value.length === expected.length && value.every((entry, index) => entry === expected[index]);
 }
 
 function rowToStoryImage(row: StoryImageRow): StoredStoryImage {

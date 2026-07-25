@@ -112,6 +112,40 @@ describe("world archive", () => {
     expect(store.getWorldStory(world.id)?.chapters[1].beats[0].id).toBe("chapter-2-beat-1");
   });
 
+  it("preserves revision-specific chapter and perspective beat identities during migration", () => {
+    const store = new WorldStore(new DatabaseSync(":memory:"));
+    const world = createWorld(store, "Revision Archive");
+    store.saveWorldStory({
+      worldId: world.id,
+      characters: [{ id: "test-character", name: "Test Character", role: "Watcher", visualDescription: "Test coat", personality: "Careful", goal: "Observe the test signal", memories: [] }],
+      worldState: "The test signal remains active while the current chapter is revised.",
+      source: "openai",
+      createdAt: "2026-01-01T00:00:00.000Z",
+      updatedAt: "2026-01-01T00:00:00.000Z",
+      chapters: [{
+        id: "chapter_01",
+        number: 1,
+        revision: 2,
+        title: "Revised Test Chapter",
+        narration: "The revised test chapter keeps its own visual identity so old generated assets cannot be reused.",
+        beats: [{ id: "provider_beat", description: "A revised test signal", caption: "Revised signal" }],
+      }],
+      perspectives: [{
+        characterId: "test-character",
+        chapterId: "chapter_01",
+        narration: "I observe the revised test signal.",
+        beats: [{ id: "provider_perspective_beat", description: "The revised test view", caption: "Revised view" }],
+      }],
+    });
+
+    const migrated = store.getWorldStory(world.id)!;
+    expect(migrated.chapters[0]).toMatchObject({ id: "chapter-1", number: 1, revision: 2 });
+    expect(migrated.chapters[0]?.beats.map((beat) => beat.id)).toEqual(["chapter-1-r2-beat-1"]);
+    expect(migrated.perspectives[0]).toMatchObject({ chapterId: "chapter-1", characterId: "test-character" });
+    expect(migrated.perspectives[0]?.beats.map((beat) => beat.id)).toEqual(["chapter-1-r2-test-character-beat-1"]);
+    expect(store.getWorldStory(world.id)?.chapters[0]?.beats[0]?.id).toBe("chapter-1-r2-beat-1");
+  });
+
   it("removes legacy raw author commands from visible world state", () => {
     const store = new WorldStore(new DatabaseSync(":memory:"));
     const world = createWorld(store, "State Archive");

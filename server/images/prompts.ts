@@ -1,9 +1,11 @@
 import { createHash } from "node:crypto";
+import type { StoryCharacter, WorldStory } from "../story.js";
 import type { World } from "../worlds.js";
 import type { ImageMoment, ImageRequest } from "./types.js";
 
-// This generic prompt version ensures retired demo imagery is never reused.
-export const IMAGE_PROMPT_VERSION = "storyverse-cinematic-v3";
+// This version reads the persistent story cast rather than a fixed subset of
+// world-blueprint characters, so prior limited-cast artwork is never reused.
+export const IMAGE_PROMPT_VERSION = "storyverse-cinematic-v4";
 
 const momentDetails: Record<ImageMoment, { scene: string; mood: string; camera: string }> = {
   world_cover: {
@@ -31,6 +33,24 @@ function characterId(name: string, index: number): string {
   return name.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "") || `character-${index + 1}`;
 }
 
+type VisualCharacter = Pick<StoryCharacter, "id" | "name" | "role" | "visualDescription">;
+
+/**
+ * The world blueprint is useful before Chapter 1 exists, but the story cast
+ * is canonical once it has been generated. Crucially, this intentionally does
+ * not take a first-N slice: every persisted character remains part of the
+ * world’s visual continuity contract.
+ */
+function visualCast(world: World, story?: WorldStory | null): VisualCharacter[] {
+  if (story?.characters.length) return story.characters.map(({ id, name, role, visualDescription }) => ({ id, name, role, visualDescription }));
+  return world.characters.map((character, index) => ({
+    id: characterId(character.name, index),
+    name: character.name,
+    role: character.role,
+    visualDescription: `${character.trait} presence`,
+  }));
+}
+
 export function imageCacheKey(request: Omit<ImageRequest, "retry">): string {
   const stable = JSON.stringify({
     version: IMAGE_PROMPT_VERSION,
@@ -43,13 +63,19 @@ export function imageCacheKey(request: Omit<ImageRequest, "retry">): string {
   return createHash("sha256").update(stable).digest("hex").slice(0, 40);
 }
 
-/** Builds image context solely from persisted world data and chapter beats.
- * No story, cast, or plot is baked into the visual-generation path. */
-export function buildImagePrompt(world: World, request: Omit<ImageRequest, "retry">, visualBeat?: string | null): { prompt: string; characterIds: string[] } {
+/** Builds image context solely from persisted world/story data and chapter beats.
+ * No cast or plot is baked into the visual-generation path. */
+export function buildImagePrompt(
+  world: World,
+  request: Omit<ImageRequest, "retry">,
+  visualBeat?: string | null,
+  story?: WorldStory | null,
+): { prompt: string; characterIds: string[] } {
   const details = momentDetails[request.moment];
-  const characterIds = world.characters.slice(0, 4).map((character, index) => characterId(character.name, index));
-  const characterDescriptions = world.characters.slice(0, 4)
-    .map((character) => `${clean(character.name)} — ${clean(character.role)}, ${clean(character.trait)}.`)
+  const characters = visualCast(world, story);
+  const characterIds = characters.map((character) => character.id);
+  const characterDescriptions = characters
+    .map((character) => `${clean(character.name)} — ${clean(character.role)}; ${clean(character.visualDescription)}.`)
     .join(" ");
   const sceneContext = request.moment === "world_cover"
     ? `Premise: ${clean(world.premise)}. Creative direction: ${clean(world.creatorPrompt)}. Opening moment: ${clean(world.openingScene)}.`
@@ -71,7 +97,7 @@ export function buildImagePrompt(world: World, request: Omit<ImageRequest, "retr
     sceneContext,
     continuity,
     `Mood and lighting: ${details.mood}. Camera: ${details.camera}.`,
-    `Character continuity: ${characterDescriptions || "Use the world’s saved central characters with clearly distinguishable silhouettes."}`,
+    `Character continuity: ${characterDescriptions || "Use the world’s saved central characters with clearly distinguishable silhouettes."} Show only people relevant to the saved visual beat, but preserve every listed character’s identity when they appear.`,
     viewpoint,
     epicCover,
     "Keep people, objects, locations, and visual motifs coherent with the saved context. Rich atmospheric detail, filmic depth, inclusive human characters.",

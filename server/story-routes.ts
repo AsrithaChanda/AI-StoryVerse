@@ -1,11 +1,13 @@
 import { Router, type Request, type Response } from "express";
 import { z } from "zod";
-import { generateInitialStory, generateNextChapter, generateNextChapterStream, generatePerspective, generatePerspectiveStream, type StoryStreamCallbacks, type WorldStory } from "./story.js";
+import { generateInitialStory, generateNextChapter, generateNextChapterStream, generatePerspective, generatePerspectiveStream, MAX_UPCOMING_DIRECTIONS, reviseLatestChapter, reviseLatestChapterStream, type ChapterRevisionGeneration, type NextChapterGeneration, type StoryStreamCallbacks, type WorldStory } from "./story.js";
 import type { WorldStore } from "./worlds.js";
 
 const id = z.string().trim().min(1).max(64).regex(/^[a-z0-9_-]+$/i);
 const commandSchema = z.object({ command: z.string().trim().min(3).max(1000) }).strict();
 const characterSchema = z.object({ characterId: id }).strict();
+const directionSchema = z.object({ direction: z.string().trim().min(3).max(1000) }).strict();
+const revisionSchema = z.object({ prompt: z.string().trim().min(3).max(1000) }).strict();
 
 type StreamPhase = { stage: "writing" | "validating" };
 
@@ -39,6 +41,31 @@ function streamComplete(response: Response, payload: unknown): void {
   response.end();
 }
 
+function appendGeneratedChapter(existing: WorldStory, generated: NextChapterGeneration): WorldStory {
+  return {
+    ...existing,
+    characters: [...existing.characters, ...generated.newCharacters],
+    chapters: [...existing.chapters, generated.chapter],
+    // Directions are a one-shot queue: they remain intact if generation or
+    // persistence fails, then clear only in the successful saved result.
+    upcomingDirections: [],
+  };
+}
+
+function replaceLatestChapter(existing: WorldStory, generated: ChapterRevisionGeneration): WorldStory | null {
+  const current = existing.chapters.at(-1);
+  const { chapter } = generated;
+  if (!current || current.id !== chapter.id || current.number !== chapter.number) return null;
+  return {
+    ...existing,
+    characters: [...existing.characters, ...generated.newCharacters],
+    chapters: [...existing.chapters.slice(0, -1), chapter],
+    // Character views and their image beats describe the prior canonical
+    // text, so they must be regenerated after a revision.
+    perspectives: existing.perspectives.filter((entry) => entry.chapterId !== current.id),
+  };
+}
+
 export function createStoryRouter(store: WorldStore): Router {
   const router = Router();
   router.get("/worlds/:worldId/story", (request, response) => {
@@ -59,14 +86,61 @@ export function createStoryRouter(store: WorldStore): Router {
     const story = store.saveWorldStory(generated);
     return response.json({ story });
   });
+  router.post("/worlds/:worldId/story/directions", (request, response) => {
+    const parsed = directionSchema.safeParse(request.body);
+    if (!parsed.success) return response.status(400).json({ error: "A 3–1000 character upcoming direction is required" });
+    const world = store.get(request.params.worldId);
+    if (!world) return response.status(404).json({ error: "World not found" });
+    const existing = store.getWorldStory(world.id);
+    if (!existing) return response.status(409).json({ error: "Generate Chapter 1 first" });
+    const direction = parsed.data.direction.replace(/\s+/g, " ");
+    const queued = existing.upcomingDirections ?? [];
+    if (queued.some((entry) => entry.toLocaleLowerCase() === direction.toLocaleLowerCase())) return response.json({ story: existing });
+    if (queued.length >= MAX_UPCOMING_DIRECTIONS) return response.status(409).json({ error: `You can queue up to ${MAX_UPCOMING_DIRECTIONS} directions before generating the next chapter` });
+    return response.json({ story: store.saveWorldStory({ ...existing, upcomingDirections: [...queued, direction] }) });
+  });
+  router.post("/worlds/:worldId/story/revise", async (request, response) => {
+    const parsed = revisionSchema.safeParse(request.body);
+    if (!parsed.success) return response.status(400).json({ error: "A 3–1000 character revision prompt is required" });
+    const world = store.get(request.params.worldId);
+    if (!world) return response.status(404).json({ error: "World not found" });
+    const existing = store.getWorldStory(world.id);
+    if (!existing) return response.status(409).json({ error: "Generate Chapter 1 first" });
+    const generated = await reviseLatestChapter(world, existing, parsed.data.prompt);
+    if (!generated) return response.status(503).json({ error: "The current chapter could not be revised" });
+    const updated = replaceLatestChapter(existing, generated);
+    if (!updated) return response.status(409).json({ error: "The current chapter changed before the revision could be saved" });
+    const story = store.saveWorldStory(updated);
+    return response.json({ story, chapter: generated.chapter });
+  });
+  router.post("/worlds/:worldId/story/revise/stream", async (request, response) => {
+    const parsed = revisionSchema.safeParse(request.body);
+    if (!parsed.success) return response.status(400).json({ error: "A 3–1000 character revision prompt is required" });
+    const world = store.get(request.params.worldId);
+    if (!world) return response.status(404).json({ error: "World not found" });
+    const existing = store.getWorldStory(world.id);
+    if (!existing) return response.status(409).json({ error: "Generate Chapter 1 first" });
+    beginSse(response);
+    writeSse(response, "phase", { stage: "writing" } satisfies StreamPhase);
+    const generated = await reviseLatestChapterStream(world, existing, parsed.data.prompt, storyStreamCallbacks(response));
+    if (!generated) return streamError(response, "The current chapter could not be revised");
+    const updated = replaceLatestChapter(existing, generated);
+    if (!updated) return streamError(response, "The current chapter changed before the revision could be saved");
+    try {
+      const story = store.saveWorldStory(updated);
+      streamComplete(response, { story, chapter: generated.chapter });
+    } catch {
+      streamError(response, "The current chapter could not be saved");
+    }
+  });
   router.post("/worlds/:worldId/story/next", async (request, response) => {
     const world = store.get(request.params.worldId);
     if (!world) return response.status(404).json({ error: "World not found" });
     const existing = store.getWorldStory(world.id);
     if (!existing) return response.status(409).json({ error: "Generate Chapter 1 first" });
-    const chapter = await generateNextChapter(world, existing);
-    if (!chapter) return response.status(503).json({ error: "The next chapter could not be generated" });
-    return response.json({ story: store.saveWorldStory({ ...existing, chapters: [...existing.chapters, chapter] }) });
+    const generated = await generateNextChapter(world, existing);
+    if (!generated) return response.status(503).json({ error: "The next chapter could not be generated" });
+    return response.json({ story: store.saveWorldStory(appendGeneratedChapter(existing, generated)) });
   });
   router.post("/worlds/:worldId/story/next/stream", async (request, response) => {
     const world = store.get(request.params.worldId);
@@ -75,11 +149,11 @@ export function createStoryRouter(store: WorldStore): Router {
     if (!existing) return response.status(409).json({ error: "Generate Chapter 1 first" });
     beginSse(response);
     writeSse(response, "phase", { stage: "writing" } satisfies StreamPhase);
-    const chapter = await generateNextChapterStream(world, existing, storyStreamCallbacks(response));
-    if (!chapter) return streamError(response, "The next chapter could not be generated");
+    const generated = await generateNextChapterStream(world, existing, storyStreamCallbacks(response));
+    if (!generated) return streamError(response, "The next chapter could not be generated");
     try {
-      const story = store.saveWorldStory({ ...existing, chapters: [...existing.chapters, chapter] });
-      streamComplete(response, { story, chapter });
+      const story = store.saveWorldStory(appendGeneratedChapter(existing, generated));
+      streamComplete(response, { story, chapter: generated.chapter });
     } catch {
       streamError(response, "The next chapter could not be saved");
     }
@@ -91,11 +165,11 @@ export function createStoryRouter(store: WorldStore): Router {
     if (!world) return response.status(404).json({ error: "World not found" });
     const existing = store.getWorldStory(world.id);
     if (!existing) return response.status(409).json({ error: "Generate Chapter 1 first" });
-    const chapter = await generateNextChapter(world, existing, parsed.data.command);
-    if (!chapter) return response.status(503).json({ error: "The command could not be applied" });
+    const generated = await generateNextChapter(world, existing, parsed.data.command);
+    if (!generated) return response.status(503).json({ error: "The command could not be applied" });
     // The command is retained on the generated chapter for auditability, but
     // must never leak into reader-facing world state or later model context.
-    return response.json({ story: store.saveWorldStory({ ...existing, chapters: [...existing.chapters, chapter] }) });
+    return response.json({ story: store.saveWorldStory(appendGeneratedChapter(existing, generated)) });
   });
   router.post("/worlds/:worldId/story/command/stream", async (request, response) => {
     const parsed = commandSchema.safeParse(request.body);
@@ -106,11 +180,11 @@ export function createStoryRouter(store: WorldStore): Router {
     if (!existing) return response.status(409).json({ error: "Generate Chapter 1 first" });
     beginSse(response);
     writeSse(response, "phase", { stage: "writing" } satisfies StreamPhase);
-    const chapter = await generateNextChapterStream(world, existing, storyStreamCallbacks(response), parsed.data.command);
-    if (!chapter) return streamError(response, "The command could not be applied");
+    const generated = await generateNextChapterStream(world, existing, storyStreamCallbacks(response), parsed.data.command);
+    if (!generated) return streamError(response, "The command could not be applied");
     try {
-      const story = store.saveWorldStory({ ...existing, chapters: [...existing.chapters, chapter] });
-      streamComplete(response, { story, chapter });
+      const story = store.saveWorldStory(appendGeneratedChapter(existing, generated));
+      streamComplete(response, { story, chapter: generated.chapter });
     } catch {
       streamError(response, "The command could not be saved");
     }

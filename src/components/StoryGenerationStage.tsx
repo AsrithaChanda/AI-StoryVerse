@@ -2,7 +2,7 @@ import { useId } from "react";
 import "../styles/story-generation-stage.css";
 
 export type StoryGenerationStageProps = {
-  kind: "chapter" | "perspective";
+  kind: "chapter" | "perspective" | "revision";
   number?: number;
   characterName?: string;
   narration: string;
@@ -11,6 +11,7 @@ export type StoryGenerationStageProps = {
 
 function subjectFor({ kind, number, characterName }: Pick<StoryGenerationStageProps, "kind" | "number" | "characterName">): string {
   if (kind === "chapter") return number ? `Chapter ${number}` : "the next chapter";
+  if (kind === "revision") return number ? `Chapter ${number}` : "this chapter";
   const name = characterName?.trim();
   return name ? `${name}'s perspective` : "this character's perspective";
 }
@@ -21,10 +22,13 @@ export default function StoryGenerationStage({ kind, number, characterName, narr
   const subject = subjectFor({ kind, number, characterName });
   const hasDraft = narration.trim().length > 0;
   const isValidating = phase === "validating";
-  const title = isValidating ? `Securing ${subject}` : `Writing ${subject}`;
+  const action = kind === "revision" ? "Revising" : "Writing";
+  const title = isValidating ? `Securing ${kind === "revision" ? "the revision for " : ""}${subject}` : `${action} ${subject}`;
   const liveStatus = isValidating
     ? "The draft is being checked against the saved world, characters, and recent events."
-    : "Writing is in progress. The story engine is carrying forward the saved world and character context.";
+    : kind === "revision"
+      ? "Rewriting this chapter while preserving the saved world, cast, and later continuity."
+      : "Writing is in progress. The story engine is carrying forward the saved world and character context.";
 
   return <section className={`story-generation-stage story-generation-stage--${phase}`} aria-labelledby={titleId} aria-describedby={statusId}>
     <div className="story-generation-stage__atmosphere" aria-hidden="true"><i /><i /><i /></div>
@@ -46,11 +50,11 @@ export default function StoryGenerationStage({ kind, number, characterName, narr
 
     <ol className="story-generation-stage__steps" aria-label="Generation stages">
       <li className="is-complete"><span>01</span><div><b>Load continuity</b><small>Saved world context and character history are in place.</small></div></li>
-      <li className={isValidating ? "is-complete" : "is-active"}><span>02</span><div><b>Write the draft</b><small>{isValidating ? "Draft captured." : `Developing ${subject}.`}</small></div></li>
-      <li className={isValidating ? "is-active" : ""}><span>03</span><div><b>Secure the draft</b><small>Continuity and perspective are checked before the chapter is shown.</small></div></li>
+      <li className={isValidating ? "is-complete" : "is-active"}><span>02</span><div><b>{kind === "revision" ? "Rewrite the chapter" : "Write the draft"}</b><small>{isValidating ? "Draft captured." : `Developing ${subject}.`}</small></div></li>
+      <li className={isValidating ? "is-active" : ""}><span>03</span><div><b>{kind === "revision" ? "Secure the revision" : "Secure the draft"}</b><small>Continuity and perspective are checked before the chapter is shown.</small></div></li>
       <li><span>04</span><div><b>Render illustrations</b><small>Scene art appears in stages after the draft is secured.</small></div></li>
     </ol>
 
-    <p className="story-generation-stage__promise"><span aria-hidden="true">✦</span> The written chapter appears first. Its cinematic illustrations continue safely in the background.</p>
+    <p className="story-generation-stage__promise"><span aria-hidden="true">✦</span> {kind === "revision" ? "The updated chapter appears first. Its matching cinematic illustrations continue safely in the background." : "The written chapter appears first. Its cinematic illustrations continue safely in the background."}</p>
   </section>;
 }
