@@ -1,6 +1,7 @@
 import { Fragment, useEffect, useMemo, useRef, useState } from "react";
 import type { StoryBeat, StoryChapter, WorldStory } from "../api/story";
-import { bootstrapStory, characterPerspective, commandStory, nextChapter } from "../api/story";
+import { bootstrapStory } from "../api/story";
+import { streamCharacterPerspective, streamCommandStory, streamNextChapter, type StoryGenerationStage as StoryGenerationPhase } from "../api/story-stream";
 import type { World } from "../api/worlds";
 import { generateSceneImage, loadSceneImage } from "../images/api";
 import { prepareChapterImages } from "../images/chapter-preparation";
@@ -9,11 +10,12 @@ import ChapterBgm from "./ChapterBgm";
 import ChapterNarration from "./ChapterNarration";
 import type { AudioPlan } from "../audio/chapter-audio";
 import SceneImage from "./SceneImage";
+import StoryGenerationStage from "./StoryGenerationStage";
 import { buildStoryFlow } from "../story-layout";
 
-type ChapterGeneration = { number: number; phase: "writing" | "illustrating"; completed: number; total: number };
-type IllustrationProgress = Pick<ChapterGeneration, "number" | "completed" | "total">;
+type IllustrationProgress = { number: number; completed: number; total: number };
 type PerspectiveLoading = { characterId: string; characterName: string };
+type StreamingGeneration = { kind: "chapter" | "perspective"; number?: number; characterName?: string; narration: string; phase: StoryGenerationPhase };
 const MIN_PERSPECTIVE_LOADING_MS = 450;
 const wait = (milliseconds: number) => new Promise<void>((resolve) => globalThis.setTimeout(resolve, milliseconds));
 
@@ -27,7 +29,7 @@ export default function GeneratedWorldReader({ world, close }: { world: World; c
   const [command, setCommand] = useState("");
   const [busy, setBusy] = useState(true);
   const [error, setError] = useState<string>();
-  const [chapterGeneration, setChapterGeneration] = useState<ChapterGeneration | null>(null);
+  const [streamingGeneration, setStreamingGeneration] = useState<StreamingGeneration | null>(null);
   const [illustrationProgress, setIllustrationProgress] = useState<IllustrationProgress | null>(null);
   const [audioPlan, setAudioPlan] = useState<AudioPlan | null>(null);
   const [perspectiveLoading, setPerspectiveLoading] = useState<PerspectiveLoading | null>(null);
@@ -55,6 +57,8 @@ export default function GeneratedWorldReader({ world, close }: { world: World; c
   const moment = activeCharacter ? "perspective_scene" as const : "chapter_scene" as const;
   const readerLabel = useMemo(() => activeCharacter ? story?.characters.find((character) => character.id === activeCharacter)?.name ?? "Character" : "Narrator", [activeCharacter, story]);
   const storyFlow = useMemo(() => buildStoryFlow(viewNarration, viewBeats), [viewNarration, viewBeats]);
+  const openingCharacterName = streamingGeneration?.kind === "perspective" ? streamingGeneration.characterName : undefined;
+  const showingPerspectiveDraft = streamingGeneration?.kind === "perspective" && streamingGeneration.narration.trim().length > 0;
   const loadImage = async (request: Parameters<typeof loadSceneImage>[0]) => (await loadSceneImage(request)) ?? generateSceneImage(request);
 
   /** Archive navigation performs cache reads only. It must never bill the image
@@ -95,12 +99,17 @@ export default function GeneratedWorldReader({ world, close }: { world: World; c
     illustrationTask.current += 1;
     setIllustrationProgress(null);
     setPerspectiveLoading({ characterId, characterName: character.name });
+    setStreamingGeneration({ kind: "perspective", characterName: character.name, narration: "", phase: "writing" });
     setBusy(true); setError(undefined); setAudioPlan(null);
     try {
       // Cached perspectives can return almost instantly. Hold the transition
       // briefly so every switch communicates what is happening before content
       // changes, without delaying an actual generation request.
-      const [result] = await Promise.all([characterPerspective(world.id, characterId), wait(MIN_PERSPECTIVE_LOADING_MS)]);
+      const [result] = await Promise.all([streamCharacterPerspective(world.id, characterId, {
+        onPhase: (phase) => setStreamingGeneration((current) => current?.kind === "perspective" ? { ...current, phase } : current),
+        onNarration: (text) => setStreamingGeneration((current) => current?.kind === "perspective" ? { ...current, narration: `${current.narration}${text}` } : current),
+      }), wait(MIN_PERSPECTIVE_LOADING_MS)]);
+      if (!result.perspective) throw new Error("The story engine returned no character perspective.");
       setStory(result.story);
       setActiveCharacter(characterId);
       setViewNarration(result.perspective.narration);
@@ -121,6 +130,7 @@ export default function GeneratedWorldReader({ world, close }: { world: World; c
       const detail = reason instanceof Error ? reason.message : "Perspective could not be generated.";
       setError(`${character.name}'s perspective could not be opened. ${detail}`);
     } finally {
+      setStreamingGeneration((current) => current?.kind === "perspective" ? null : current);
       setPerspectiveLoading((current) => current?.characterId === characterId ? null : current);
       setBusy(false);
     }
@@ -130,9 +140,13 @@ export default function GeneratedWorldReader({ world, close }: { world: World; c
     if (!story || busy || illustrationProgress || !isLatestChapter) return;
     setBusy(true); setError(undefined);
     const requestedNumber = (story.chapters.at(-1)?.number ?? 0) + 1;
-    setChapterGeneration({ number: requestedNumber, phase: "writing", completed: 0, total: 0 });
+    setStreamingGeneration({ kind: "chapter", number: requestedNumber, narration: "", phase: "writing" });
     try {
-      const result = authorCommand ? await commandStory(world.id, authorCommand) : await nextChapter(world.id);
+      const handlers = {
+        onPhase: (phase: StoryGenerationPhase) => setStreamingGeneration((current) => current?.kind === "chapter" ? { ...current, phase } : current),
+        onNarration: (text: string) => setStreamingGeneration((current) => current?.kind === "chapter" ? { ...current, narration: `${current.narration}${text}` } : current),
+      };
+      const result = authorCommand ? await streamCommandStory(world.id, authorCommand, handlers) : await streamNextChapter(world.id, handlers);
       const next = result.story.chapters.at(-1);
       if (!next) throw new Error("The story engine returned no new chapter.");
       updateFromStory(result.story);
@@ -149,7 +163,7 @@ export default function GeneratedWorldReader({ world, close }: { world: World; c
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : "The story could not continue.");
     } finally {
-      setChapterGeneration(null);
+      setStreamingGeneration((current) => current?.kind === "chapter" ? null : current);
       setBusy(false);
     }
   };
@@ -165,16 +179,28 @@ export default function GeneratedWorldReader({ world, close }: { world: World; c
     <header className="reader-header"><button className="brand" type="button" onClick={close}><span className="mark">SV</span> WORLD ATLAS</button><span className="timeline-pill violet">{world.genre}</span></header>
     {busy && !story ? <div className="story-boot"><p className="eyebrow">STORY ENGINE</p><h1>Writing Chapter 1…</h1><p>Building a persistent cast, opening chapter, and image beats for {world.title}.</p></div>
       : error && !story ? <div className="story-boot"><h1>The chapter is waiting.</h1><p>{error}</p><button type="button" className="enter-button" onClick={retryBootstrap}>Try again</button></div>
-        : chapterGeneration ? <ChapterGenerationView generation={chapterGeneration} />
+        : streamingGeneration?.kind === "chapter" ? <StoryGenerationStage kind="chapter" number={streamingGeneration.number} narration={streamingGeneration.narration} phase={streamingGeneration.phase} />
           : story && chapter ? <div className="generated-grid"><section className="generated-story">
             {story.chapters.length > 1 && <nav className="chapter-archive" aria-label="Chapter history">
               <button type="button" onClick={() => showNarratorChapter(story.chapters[chapterIndex - 1])} disabled={chapterIndex <= 0}>← Previous</button>
               <span>CHAPTER {chapter.number} OF {story.chapters.length}</span>
               <button type="button" onClick={() => showNarratorChapter(story.chapters[chapterIndex + 1])} disabled={chapterIndex >= story.chapters.length - 1}>Next →</button>
             </nav>}
-            <p className="eyebrow">CHAPTER {chapter.number}</p><h1>{chapter.title}</h1><div className={`perspective-banner ${activeCharacter ? "perspective-banner--character" : ""}`}><span>NOW VIEWING</span><b>{activeCharacter ? `${readerLabel}'s perspective` : "StoryVerse narrator · canonical world view"}</b><p>{activeCharacter ? `This chapter is filtered through ${readerLabel}'s memories, goals, and observations.` : "This is the omniscient, shared version of events—not any single character’s point of view."}</p>{activeCharacter && <button type="button" className="canonical-return" onClick={() => showNarratorChapter(chapter)}>Return to canonical view →</button>}</div>{perspectiveLoading && <PerspectiveLoadingNotice characterName={perspectiveLoading.characterName} />}<ChapterBgm key={`bgm-${chapter.id}-${activeCharacter ?? "canonical"}`} worldId={world.id} chapterId={chapter.id} protagonistId={activeCharacter ?? undefined} chapterText={`${chapter.title}\n${viewNarration}`} perspective={activeCharacter ? `${readerLabel}'s POV` : "Canonical world view"} onPlan={setAudioPlan} /><ChapterNarration key={`narration-${chapter.id}-${activeCharacter ?? "canonical"}`} worldId={world.id} chapterId={chapter.id} protagonistId={activeCharacter ?? undefined} plan={audioPlan} />
-            {illustrationProgress?.number === chapter.number && <div className="illustration-progress" role="status" aria-live="polite"><span>ILLUSTRATING IN BACKGROUND</span><b>{illustrationProgress.completed} of {illustrationProgress.total} chapter scenes saved</b><i><em style={{ width: `${(illustrationProgress.completed / Math.max(1, illustrationProgress.total)) * 100}%` }} /></i></div>}
-            <div className="chapter-flow">{storyFlow.map((item, paragraphIndex) => <Fragment key={`${paragraphIndex}-${item.paragraph.slice(0, 32)}`}><p className="scene-prose">{item.paragraph}</p>{item.beats.map((beat) => <div className="story-beat" key={beat.id}><SceneImage image={storedImages[beat.id]} worldId={world.id} sceneId={beat.id} moment={moment} protagonistId={activeCharacter ?? undefined} title={beat.caption} description={beat.description} loadImage={isLatestChapter && !illustrationProgress ? loadImage : undefined} retryImage={(request) => generateSceneImage(request, true)} /></div>)}</Fragment>)}</div>
+            <p className="eyebrow">CHAPTER {chapter.number}</p>
+            <h1>{chapter.title}</h1>
+            <div className={`perspective-banner ${activeCharacter || openingCharacterName ? "perspective-banner--character" : ""}`}>
+              <span>NOW VIEWING</span>
+              <b>{activeCharacter ? `${readerLabel}'s perspective` : openingCharacterName ? `Opening ${openingCharacterName}'s perspective…` : "StoryVerse narrator · canonical world view"}</b>
+              <p>{activeCharacter ? `This chapter is filtered through ${readerLabel}'s memories, goals, and observations.` : openingCharacterName ? `The saved canonical chapter remains unchanged while this lens is written from ${openingCharacterName}'s memories, goals, and observations.` : "This is the omniscient, shared version of events—not any single character’s point of view."}</p>
+              {activeCharacter && <button type="button" className="canonical-return" onClick={() => showNarratorChapter(chapter)}>Return to canonical view →</button>}
+            </div>
+            {perspectiveLoading && <PerspectiveLoadingNotice characterName={perspectiveLoading.characterName} />}
+            {showingPerspectiveDraft && streamingGeneration ? <StoryGenerationStage kind="perspective" characterName={streamingGeneration.characterName} narration={streamingGeneration.narration} phase={streamingGeneration.phase} /> : <>
+              <ChapterBgm key={`bgm-${chapter.id}-${activeCharacter ?? "canonical"}`} worldId={world.id} chapterId={chapter.id} protagonistId={activeCharacter ?? undefined} chapterText={`${chapter.title}\n${viewNarration}`} perspective={activeCharacter ? `${readerLabel}'s POV` : "Canonical world view"} onPlan={setAudioPlan} />
+              <ChapterNarration key={`narration-${chapter.id}-${activeCharacter ?? "canonical"}`} worldId={world.id} chapterId={chapter.id} protagonistId={activeCharacter ?? undefined} plan={audioPlan} />
+              {illustrationProgress?.number === chapter.number && <div className="illustration-progress" role="status" aria-live="polite"><span>ILLUSTRATING IN BACKGROUND</span><b>{illustrationProgress.completed} of {illustrationProgress.total} chapter scenes saved</b><i><em style={{ width: `${(illustrationProgress.completed / Math.max(1, illustrationProgress.total)) * 100}%` }} /></i></div>}
+              <div className="chapter-flow">{storyFlow.map((item, paragraphIndex) => <Fragment key={`${paragraphIndex}-${item.paragraph.slice(0, 32)}`}><p className="scene-prose">{item.paragraph}</p>{item.beats.map((beat) => <div className="story-beat" key={beat.id}><SceneImage image={storedImages[beat.id]} worldId={world.id} sceneId={beat.id} moment={moment} protagonistId={activeCharacter ?? undefined} title={beat.caption} description={beat.description} loadImage={isLatestChapter && !illustrationProgress ? loadImage : undefined} preparing={Boolean(illustrationProgress)} retryImage={(request) => generateSceneImage(request, true)} /></div>)}</Fragment>)}</div>
+            </>}
             {isLatestChapter ? <><div className="author-command"><label htmlFor="story-command">Change the story</label><textarea id="story-command" value={command} maxLength={1000} onChange={(event) => setCommand(event.target.value)} placeholder="For example: introduce a storm that separates the allies, but keep the mentor alive." /><button type="button" disabled={busy || Boolean(illustrationProgress) || command.trim().length < 3} onClick={() => void advance(command.trim())}>Apply command →</button></div><button className="next-chapter" type="button" disabled={busy || Boolean(illustrationProgress)} onClick={() => void advance()}>{illustrationProgress ? "Illustrating chapter…" : "Generate next chapter →"}</button></> : <div className="archive-note"><span>ARCHIVED CHAPTER</span><p>This chapter and its illustrations are preserved. Return to the latest chapter to continue the world’s timeline.</p><button type="button" onClick={() => showNarratorChapter(story.chapters.at(-1)!)}>Return to latest chapter →</button></div>}
             {error && <p className="story-error" role="status">{error}</p>}
           </section><aside className="story-cast"><p className="panel-label">PERSISTENT CAST</p>{story.characters.map((character) => {
@@ -186,15 +212,10 @@ export default function GeneratedWorldReader({ world, close }: { world: World; c
   </main>;
 }
 
-function ChapterGenerationView({ generation }: { generation: ChapterGeneration }) {
-  const width = generation.phase === "writing" ? "12%" : `${Math.max(8, (generation.completed / Math.max(1, generation.total)) * 100)}%`;
-  return <div className="chapter-generation" role="status" aria-live="polite"><p className="eyebrow">STORY ENGINE · CHAPTER {generation.number}</p><h1>{generation.phase === "writing" ? `Generating Chapter ${generation.number}…` : `Illustrating Chapter ${generation.number}…`}</h1><p>{generation.phase === "writing" ? "Writing the next turn while preserving the world, cast, and continuity." : `Preparing the complete visual sequence — scene ${generation.completed} of ${generation.total} ready.`}</p><div className="chapter-generation__meter" aria-hidden="true"><span style={{ width }} /></div><small>The chapter appears as soon as its story is ready; illustrations continue safely in the background.</small></div>;
-}
-
 function PerspectiveLoadingNotice({ characterName }: { characterName: string }) {
   return <section className="perspective-loading" role="status" aria-live="polite" aria-atomic="true">
     <div className="perspective-loading__glyph" aria-hidden="true"><i /><i /><i /></div>
-    <div><span>CHARACTER LENS · LOADING</span><b>Opening {characterName}&rsquo;s perspective…</b><p>The current chapter stays readable while we gather their memories, goals, and observations.</p></div>
+    <div><span>CHARACTER LENS · LOADING</span><b>Opening {characterName}&rsquo;s perspective…</b><p>The canonical chapter stays intact while we gather their memories, goals, and observations.</p></div>
     <div className="perspective-loading__meter" aria-hidden="true"><i /></div>
   </section>;
 }

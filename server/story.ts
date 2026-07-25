@@ -1,6 +1,7 @@
 import type { World } from "./worlds.js";
 import { logWarn } from "./logger.js";
 import { extractOutputText, responseDiagnostics, type OpenAIResponsePayload } from "./openai-response.js";
+import { collectResponseOutputText, NarrationJsonDeltaDecoder } from "./story-stream.js";
 
 export type StoryCharacter = {
   id: string;
@@ -25,6 +26,13 @@ export type WorldStory = {
   source: "openai" | "fallback";
   createdAt: string;
   updatedAt: string;
+};
+
+export type StoryStreamCallbacks = {
+  /** Decoded prose from the `narration` JSON field only. */
+  onNarration?: (text: string) => void;
+  /** The provider stream has ended and full JSON validation is beginning. */
+  onPhase?: (stage: "validating") => void;
 };
 
 type InitialShape = { characters: StoryCharacter[]; chapter: StoryChapter; worldState: string };
@@ -96,6 +104,60 @@ async function modelJson<T>(instructions: string, input: string, responseSchema:
   }
 }
 
+/**
+ * Uses the same strict structured-output request as `modelJson`, but consumes
+ * the Responses API SSE stream. Raw JSON is kept server-side; only decoded
+ * `narration` fragments are forwarded through the callback.
+ */
+async function modelJsonStream<T>(
+  instructions: string,
+  input: string,
+  responseSchema: object,
+  callbacks: StoryStreamCallbacks,
+): Promise<T | null> {
+  const key = process.env.OPENAI_API_KEY;
+  if (!key) {
+    logWarn("story.generation.unavailable", { reason: "missing_api_key" });
+    return null;
+  }
+  try {
+    const response = await fetch("https://api.openai.com/v1/responses", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Accept: "text/event-stream", Authorization: `Bearer ${key}` },
+      body: JSON.stringify({
+        model: process.env.OPENAI_MODEL || "gpt-4.1-mini",
+        instructions,
+        input,
+        stream: true,
+        text: { format: { type: "json_schema", name: "story_payload", strict: true, schema: responseSchema } },
+      }),
+    });
+    if (!response.ok || !response.body) {
+      logWarn("story.generation.provider_error", { status: response.status });
+      return null;
+    }
+    const narrationDecoder = new NarrationJsonDeltaDecoder();
+    const streamed = await collectResponseOutputText(response.body, (rawDelta) => {
+      const narration = narrationDecoder.push(rawDelta);
+      if (narration) callbacks.onNarration?.(narration);
+    });
+    if (!streamed.ok) {
+      logWarn("story.generation.stream_error", { reason: streamed.reason });
+      return null;
+    }
+    callbacks.onPhase?.("validating");
+    try {
+      return JSON.parse(streamed.outputText) as T;
+    } catch {
+      logWarn("story.generation.invalid_response", { reason: "invalid_json" });
+      return null;
+    }
+  } catch (error) {
+    logWarn("story.generation.request_error", { reason: error instanceof Error ? error.name : "unknown" });
+    return null;
+  }
+}
+
 const originalGuard = "Create original characters and an original plot. A user-supplied title or genre may evoke an existing work, but never reuse protected named characters, dialogue, plot events, costumes, or scenes from it. Do not include real-world celebrity likenesses.";
 
 export async function generateInitialStory(world: World): Promise<WorldStory> {
@@ -125,6 +187,25 @@ export async function generateNextChapter(world: World, story: WorldStory, comma
   return normalizeChapter(payload, previous.number + 1, command);
 }
 
+/** Stream a next chapter while keeping raw structured JSON on the server. */
+export async function generateNextChapterStream(
+  world: World,
+  story: WorldStory,
+  callbacks: StoryStreamCallbacks,
+  command?: string,
+): Promise<StoryChapter | null> {
+  const previous = story.chapters.at(-1);
+  if (!previous || story.characters.length === 0) return null;
+  const chapterSchema = { type: "object", additionalProperties: false, required: ["id", "number", "title", "narration", "beats", "audioDirection"], properties: schema.properties.chapter.properties };
+  const payload = await modelJsonStream<StoryChapter>(
+    `You continue an original StoryVerse serial. ${originalGuard} Preserve every character's visual description, personality, goal, and memories. Advance exactly one chapter with three to four imageable beats. Set audioDirection from the new chapter's actual emotional context: select the primary and secondary emotion, intensity 0–1, local BGM cue, and a concise narration delivery.`,
+    `World: ${world.title}\nPremise: ${world.premise}\nWorld state: ${story.worldState}\nCharacters: ${JSON.stringify(story.characters)}\nPrevious chapter: ${previous.narration}\nAuthor command: ${command ?? "Continue the central conflict naturally."}\nWrite chapter ${previous.number + 1}.`, chapterSchema,
+    callbacks,
+  );
+  if (!payload?.narration || !Array.isArray(payload.beats)) return null;
+  return normalizeChapter(payload, previous.number + 1, command);
+}
+
 export async function generatePerspective(world: World, story: WorldStory, characterId: string): Promise<Perspective | null> {
   const character = story.characters.find((candidate) => candidate.id === characterId);
   const chapter = story.chapters.at(-1);
@@ -133,6 +214,26 @@ export async function generatePerspective(world: World, story: WorldStory, chara
   const payload = await modelJson<{ narration: string; beats: StoryBeat[] }>(
     `You write an original character point-of-view retelling. ${originalGuard} Use only the selected character's stated memories, personality, goal, and observations. Never invent hidden knowledge from other characters.`,
     `World: ${world.title}\nSelected character: ${JSON.stringify(character)}\nCurrent chapter: ${chapter.narration}\nReturn a close POV retelling and 3–4 imageable beats.`, perspectiveSchema,
+  );
+  if (!payload?.narration || !Array.isArray(payload.beats)) return null;
+  return { characterId, chapterId: chapter.id, narration: payload.narration, beats: payload.beats.map((beat, index) => ({ ...beat, id: `${chapter.id}-${characterId}-beat-${index + 1}` })) };
+}
+
+/** Stream an isolated character perspective after the whole payload validates. */
+export async function generatePerspectiveStream(
+  world: World,
+  story: WorldStory,
+  characterId: string,
+  callbacks: StoryStreamCallbacks,
+): Promise<Perspective | null> {
+  const character = story.characters.find((candidate) => candidate.id === characterId);
+  const chapter = story.chapters.at(-1);
+  if (!character || !chapter) return null;
+  const perspectiveSchema = { type: "object", additionalProperties: false, required: ["narration", "beats"], properties: { narration: { type: "string", minLength: 280, maxLength: 2200 }, beats: schema.properties.chapter.properties.beats } };
+  const payload = await modelJsonStream<{ narration: string; beats: StoryBeat[] }>(
+    `You write an original character point-of-view retelling. ${originalGuard} Use only the selected character's stated memories, personality, goal, and observations. Never invent hidden knowledge from other characters.`,
+    `World: ${world.title}\nSelected character: ${JSON.stringify(character)}\nCurrent chapter: ${chapter.narration}\nReturn a close POV retelling and 3–4 imageable beats.`, perspectiveSchema,
+    callbacks,
   );
   if (!payload?.narration || !Array.isArray(payload.beats)) return null;
   return { characterId, chapterId: chapter.id, narration: payload.narration, beats: payload.beats.map((beat, index) => ({ ...beat, id: `${chapter.id}-${characterId}-beat-${index + 1}` })) };

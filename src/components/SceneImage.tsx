@@ -26,6 +26,9 @@ export type SceneImageProps = {
   description?: string;
   /** The controller may asynchronously fetch cached metadata or request generation. */
   loadImage?(request: SceneImageRequest): Promise<StoryImage | null | undefined>;
+  /** A chapter-level illustration queue is working on this image. This lets
+   * the host avoid duplicate image calls while the frame remains truthful. */
+  preparing?: boolean;
   /** Retrying remains an explicit user action after a failed image request. */
   retryImage?(request: SceneImageRequest): Promise<StoryImage | null | undefined>;
   className?: string;
@@ -46,7 +49,7 @@ function isUsable(image: StoryImage | null | undefined): image is UsableStoryIma
  * Stable cinematic image frame for the reader and timeline comparison.
  * It renders its CSS fallback synchronously and only replaces it after a usable URL loads.
  */
-export default function SceneImage({ image, moment, worldId, sceneId, branchId, protagonistId, title, description, loadImage, retryImage, className = "" }: SceneImageProps) {
+export default function SceneImage({ image, moment, worldId, sceneId, branchId, protagonistId, title, description, loadImage, preparing = false, retryImage, className = "" }: SceneImageProps) {
   const request = useMemo<SceneImageRequest>(() => ({ worldId, sceneId, branchId, moment, protagonistId }), [worldId, sceneId, branchId, moment, protagonistId]);
   const requestKey = `${worldId}:${sceneId ?? "auto"}:${branchId ?? "root"}:${moment}:${protagonistId ?? "ensemble"}`;
   const [resolved, setResolved] = useState<{ key: string; image: StoryImage | null | undefined }>();
@@ -69,7 +72,8 @@ export default function SceneImage({ image, moment, worldId, sceneId, branchId, 
   const accent = moment === "perspective_scene" ? "violet" : "amber";
   const pov = Boolean(protagonistId);
   const failed = failedKey === requestKey || shown?.status === "failed";
-  const automaticLoading = Boolean(loadImage && !ready && !failed && shown?.status !== "failed");
+  const queuedForRendering = preparing && !ready && !failed;
+  const automaticLoading = Boolean(queuedForRendering || (loadImage && !ready && !failed && shown?.status !== "failed"));
   const status = failed ? "failed" : retrying || automaticLoading || shown?.status === "pending" ? "loading" : ready ? "ready" : "fallback";
   const retry = async () => {
     if (!retryImage || retrying) return;
@@ -88,8 +92,9 @@ export default function SceneImage({ image, moment, worldId, sceneId, branchId, 
       {ready && <img className="story-image__asset" src={shown.imageUrl} alt={description ?? `${title}. Cinematic story image.`} onError={() => setFailedKey(requestKey)} />}
       <div className="story-image__veil" aria-hidden="true" />
       <div className="story-image__chrome"><span className="story-image__label">{MOMENT_LABEL[moment]}</span>{pov && <span className="story-image__pov">CHARACTER POV</span>}</div>
+      {!ready && <div className="story-image__brief" aria-hidden="true"><span>{status === "loading" ? "SCENE IS RENDERING" : "SCENE BRIEF"}</span><b>{title}</b>{description && <p>{description}</p>}</div>}
       <div className="story-image__status" id={statusId} aria-live="polite">
-        {status === "loading" && "Imagining this moment…"}
+        {status === "loading" && (queuedForRendering ? "This illustration is rendering in the background…" : "Loading this scene’s illustration…")}
         {status === "failed" && "A remembered illustration could not arrive. The scene is still yours."}
         {status === "fallback" && "Illustrated from the StoryVerse archive."}
       </div>
