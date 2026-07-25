@@ -22,12 +22,27 @@ Copy [`.env.example`](../.env.example) to `.env` for local work. Do not commit `
 | `STORYVERSE_PG_POOL_MAX`, `STORYVERSE_PG_IDLE_TIMEOUT_MS`, `STORYVERSE_PG_CONNECT_TIMEOUT_MS` | PostgreSQL | Per-app-instance pool and connection timeouts. Start with the supplied conservative values, then tune after observing concurrency and Lakebase limits. |
 | `STORYVERSE_ASSET_STORAGE` | Always | `local` or `databricks-volume`. |
 | `DATABRICKS_HOST` | `databricks-volume` | Full Databricks workspace URL, such as `https://<workspace-host>`. |
-| `DATABRICKS_TOKEN` | `databricks-volume` | Bearer token used by the Databricks Files API. Use a managed secret, never source control. |
+| `DATABRICKS_CLIENT_ID`, `DATABRICKS_CLIENT_SECRET` | Preferred for `databricks-volume` production | Databricks service-principal OAuth client credentials. StoryVerse exchanges them for cached workspace access tokens. Store both as managed secrets; never put them in source control, plaintext App configuration, or browser-visible settings. |
+| `DATABRICKS_TOKEN` | `databricks-volume` only when M2M credentials are not used | Static bearer-token compatibility fallback for short-lived local/PAT testing. Do not use it as the primary production credential. |
 | `DATABRICKS_VOLUME_PATH` | `databricks-volume` | `/Volumes/<catalog>/<schema>/<volume>/storyverse`; StoryVerse creates media beneath this root. |
 | `OPENAI_API_KEY` | Live world, chapter, perspective, image, or narration generation | Server-only OpenAI credential. The app still starts without it, but live generation falls back or is unavailable as appropriate. |
 | `PORT` | Local/Docker | HTTP port. Databricks Apps supplies the Express `PORT` at runtime. |
 
 For Lakebase, use `PGSSLMODE=require`. Do not use the development PostgreSQL password from `docker-compose.yml` outside a local machine.
+
+### Databricks Files API authentication
+
+For production media storage, use a Databricks service principal with `DATABRICKS_CLIENT_ID` and `DATABRICKS_CLIENT_SECRET`. StoryVerse requests a workspace-scoped OAuth token with the client-credentials flow at:
+
+```text
+<DATABRICKS_HOST>/oidc/v1/token
+```
+
+It caches the resulting access token, refreshes it before expiry, and retries a request once after an early `401`. This is a workspace Files API flow: `DATABRICKS_HOST` must be the target workspace URL, and **no `DATABRICKS_ACCOUNT_ID` is required**. Keep the client ID and client secret in the deployment platform's secret manager, even though the ID alone is not generally sensitive.
+
+`DATABRICKS_TOKEN` remains accepted as a non-refreshing bearer-token fallback for a short-lived local experiment or PAT compatibility. Configure exactly one authentication method: leave `DATABRICKS_TOKEN` unset when using OAuth M2M. It is deliberately not the recommended production mechanism because StoryVerse cannot rotate that static value itself.
+
+See [Databricks OAuth M2M authentication](https://docs.databricks.com/aws/en/dev-tools/auth/oauth-m2m) for service-principal and OAuth-secret setup.
 
 ## Local testing
 
@@ -86,8 +101,8 @@ For a non-Databricks production platform:
 
 1. Build the image from a clean source tree; `.env` and `data/` are excluded by [`.dockerignore`](../.dockerignore).
 2. Provide a managed PostgreSQL connection through `DATABASE_URL` or `PG*`; enable TLS in the provider configuration.
-3. Set `STORYVERSE_ASSET_STORAGE=databricks-volume` only after the three Databricks asset variables are present. Otherwise use a durable mounted disk with `local`.
-4. Store `OPENAI_API_KEY` and `DATABRICKS_TOKEN` in that platform's secret manager.
+3. Set `STORYVERSE_ASSET_STORAGE=databricks-volume` only after `DATABRICKS_HOST`, `DATABRICKS_VOLUME_PATH`, and one supported Databricks authentication configuration are present. Use the managed-secret `DATABRICKS_CLIENT_ID` plus `DATABRICKS_CLIENT_SECRET` pair in production; otherwise use a durable mounted disk with `local`.
+4. Store `OPENAI_API_KEY`, `DATABRICKS_CLIENT_ID`, and `DATABRICKS_CLIENT_SECRET` in that platform's secret manager. Reserve `DATABRICKS_TOKEN` for temporary short-lived local/PAT compatibility only.
 5. Start at least two application replicas only after the database migration/initialization path has completed successfully; all replicas must point to the same PostgreSQL database and asset backend.
 6. Smoke-test `/api/health`, world creation, a chapter generation, a character POV, image retrieval, narration retrieval, timeline rollback, and a page refresh.
 
@@ -116,15 +131,16 @@ These are workspace-admin or data-owner actions; they cannot be completed only f
    ```
 
    StoryVerse uses it only for non-tabular image and narration files. Lakebase remains the transactional store.
-4. Create a Databricks App from this repository's Git source or workspace folder. Attach the UC Volume resource with **Can read and write**. Adding a Lakebase App resource is optional until OAuth credential rotation is added to StoryVerse; it is not the native-password path described above.
-5. Add secrets for `PGPASSWORD` (or `DATABASE_URL`), `OPENAI_API_KEY`, and `DATABRICKS_TOKEN` in a secret scope or your workspace's approved secret mechanism. Configure them as managed App values rather than literal text in `app.yaml`.
-6. Give the App service principal access to the configured resources. The UC volume requires `USE CATALOG`, `USE SCHEMA`, `READ VOLUME`, and `WRITE VOLUME`; adding it as a Databricks Apps resource can grant the required access when the deployer has the needed management privileges. See [UC Volume resources for Apps](https://docs.databricks.com/aws/en/dev-tools/databricks-apps/uc-volumes).
+4. Create or identify a dedicated Databricks service principal for StoryVerse media, generate its OAuth client secret, and **assign the service principal to the target workspace**. For a Databricks App, the App's dedicated service principal can be used when its OAuth client credentials are provided to the runtime through managed configuration.
+5. Create a Databricks App from this repository's Git source or workspace folder. Attach the UC Volume resource with **Can read and write**. Adding a Lakebase App resource is optional: StoryVerse's OAuth handling below is for the Files API only, not Lakebase PostgreSQL credentials, so it is not the native-password path described above.
+6. Add secrets for `PGPASSWORD` (or `DATABASE_URL`), `OPENAI_API_KEY`, `DATABRICKS_CLIENT_ID`, and `DATABRICKS_CLIENT_SECRET` in a secret scope or your workspace's approved secret mechanism. Configure them as managed App values rather than literal text in `app.yaml`. Use `DATABRICKS_TOKEN` only for a short-lived local/PAT compatibility test, not the normal App deployment.
+7. Give the service principal access to the configured resources. The UC volume requires `USE CATALOG`, `USE SCHEMA`, `READ VOLUME`, and `WRITE VOLUME`; attaching it as a Databricks Apps resource with **Can read and write** can grant the required access when the deployer has the needed management privileges. See [UC Volume resources for Apps](https://docs.databricks.com/aws/en/dev-tools/databricks-apps/uc-volumes).
 
-`DATABRICKS_TOKEN` is a Files API bearer token. It may be a PAT or OAuth access token, but it must be issued and managed according to workspace policy and have the access above. This integration does **not** claim to exchange the Databricks App service principal credentials for a token automatically; coordinate the issuance/rotation path with the workspace administrator.
+With the client credentials above, StoryVerse automatically requests and caches workspace OAuth access tokens for the Files API at `<DATABRICKS_HOST>/oidc/v1/token`. Use the workspace URL—not an account endpoint—and do not add `DATABRICKS_ACCOUNT_ID` for this integration. The service principal must be assigned to that workspace and retain the Volume privileges above. `DATABRICKS_TOKEN` is a static Files API bearer-token fallback only; it can be a PAT or OAuth token for a short-lived compatibility test, but it does not provide automated rotation.
 
 ### App configuration
 
-Use the Apps UI to add the resources and secret values, then set these non-secret environment values in the app configuration:
+Use the Apps UI to add the resources and secret values. Configure `DATABRICKS_CLIENT_ID` and `DATABRICKS_CLIENT_SECRET` as managed secrets, not literal `app.yaml` values, and leave `DATABRICKS_TOKEN` blank when OAuth M2M is selected. Then set these non-secret environment values in the app configuration:
 
 ```text
 STORYVERSE_ASSET_STORAGE=databricks-volume
@@ -162,8 +178,8 @@ After the App reports healthy, verify through the deployed URL and the Apps logs
 - [ ] New image and narration assets appear under the selected Volume path and are served through StoryVerse’s API routes.
 - [ ] Existing cached media loads without triggering a second model request.
 - [ ] The App service principal can read/write only the designated Volume, and the database role has only the privileges StoryVerse requires.
-- [ ] OpenAI and Databricks tokens never appear in browser code, client API responses, source control, or request logs.
-- [ ] A token-expiry or Files API permission failure returns a clear fallback/error state without corrupting the saved story.
+- [ ] OpenAI credentials, Databricks client credentials, and access tokens never appear in browser code, client API responses, source control, or request logs.
+- [ ] An OAuth token-refresh or Files API permission failure returns a clear fallback/error state without corrupting the saved story.
 - [ ] A second concurrent browser session can create/update separate worlds without lost updates; inspect database/app logs for transaction or optimistic-concurrency errors.
 
 ## Troubleshooting
@@ -172,7 +188,8 @@ After the App reports healthy, verify through the deployed URL and the Apps logs
 | --- | --- |
 | App starts but `GET /api/health` says SQLite | Confirm `DATABASE_URL` or complete `PG*` settings reached the runtime and that PostgreSQL is reachable. |
 | Lakebase authentication fails | Verify `PGHOST`, `PGPORT`, `PGDATABASE`, `PGUSER`, secret `PGPASSWORD`, and `PGSSLMODE=require`. Do not assume an attached App database resource alone supplies a password for the current Node adapter. |
-| Media requests fail with `403` or `404` | Check `DATABRICKS_HOST`, `DATABRICKS_TOKEN`, exact `/Volumes/...` path, and the App identity's UC volume privileges. |
+| OAuth M2M token request fails with `401` or `403` | Check the managed `DATABRICKS_CLIENT_ID` and `DATABRICKS_CLIENT_SECRET`, confirm `DATABRICKS_HOST` is the target workspace URL, and verify the service principal is assigned to that workspace. Do not use `DATABRICKS_ACCOUNT_ID` for this workspace flow. |
+| Media requests fail with `403` or `404` | Check `DATABRICKS_HOST`, the configured M2M credentials (or temporary `DATABRICKS_TOKEN` fallback), exact `/Volumes/...` path, and the service principal's `USE CATALOG`, `USE SCHEMA`, `READ VOLUME`, and `WRITE VOLUME` privileges. |
 | Databricks deployment does not build the client | Ensure `package.json` and the `build` script are committed at the app root; do not set an environment that skips build dependencies. |
 | Media is regenerated after redeploy | Confirm the database and the Volume path are both persistent and unchanged; do not switch asset backends for an existing production world without an asset migration. |
 | Docker data disappears | Use `docker compose down`, not `docker compose down -v`, and retain the named Docker volumes. |
@@ -182,4 +199,4 @@ After the App reports healthy, verify through the deployed URL and the Apps logs
 - Keep distinct development, staging, and production Lakebase branches/databases and Volume roots. Do not point test deployments at production data.
 - Back up/retain PostgreSQL according to your Lakebase policy. Treat generated media as recoverable cache only after confirming the canonical metadata and generator inputs are durable.
 - Do not expose a Volume URI or database credential directly to the browser; browser media should continue to flow through the StoryVerse API.
-- Before rotating `DATABRICKS_TOKEN` or `OPENAI_API_KEY`, install the replacement secret, redeploy/restart one replica, validate asset generation, then revoke the old credential.
+- Before rotating `DATABRICKS_CLIENT_SECRET` or `OPENAI_API_KEY`, install the replacement managed secret, redeploy/restart one replica, validate asset generation, then revoke the old credential. If a temporary `DATABRICKS_TOKEN` fallback is in use, rotate it with the same sequence and replace it with OAuth M2M for production.

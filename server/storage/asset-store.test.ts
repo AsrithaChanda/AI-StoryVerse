@@ -2,7 +2,7 @@ import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { DatabricksVolumeAssetStore } from "./databricks-volume-asset-store.js";
+import { DatabricksOAuthM2MTokenProvider, DatabricksVolumeAssetStore } from "./databricks-volume-asset-store.js";
 import { createAssetStoreFromEnvironment } from "./factory.js";
 import { LocalAssetStore } from "./local-asset-store.js";
 import { AssetStoreError } from "./types.js";
@@ -118,10 +118,84 @@ describe("DatabricksVolumeAssetStore", () => {
     expect(error).toMatchObject({ code: "provider_error" } satisfies Partial<AssetStoreError>);
     expect((error as Error).message).not.toContain("test-databricks-token");
   });
+
+  it("uses cached workspace OAuth M2M credentials for multiple Volume operations", async () => {
+    const fetcher = vi.fn<typeof fetch>()
+      .mockResolvedValueOnce(new Response(JSON.stringify({ access_token: "oauth-access-token", expires_in: 3600 }), { status: 200, headers: { "content-type": "application/json" } }))
+      .mockResolvedValueOnce(new Response(null, { status: 200 }))
+      .mockResolvedValueOnce(new Response(null, { status: 200 }));
+    const tokenProvider = new DatabricksOAuthM2MTokenProvider({
+      host: "workspace.cloud.databricks.com",
+      clientId: "service-principal-id",
+      clientSecret: "service-principal-secret",
+      fetch: fetcher,
+      now: () => 1_000,
+    });
+    const store = new DatabricksVolumeAssetStore({
+      host: "workspace.cloud.databricks.com",
+      volumePath: "/Volumes/main/default/storyverse_assets",
+      tokenProvider,
+      fetch: fetcher,
+    });
+
+    await Promise.all([
+      store.exists("images/world-1/cover.png"),
+      store.exists("narrations/world-1/chapter-1.wav"),
+    ]);
+
+    expect(fetcher).toHaveBeenCalledTimes(3);
+    expect(String(fetcher.mock.calls[0]?.[0])).toBe("https://workspace.cloud.databricks.com/oidc/v1/token");
+    expect(fetcher.mock.calls[0]?.[1]).toMatchObject({ method: "POST" });
+    expect(callHeaders(fetcher).get("authorization")).toBe("Basic c2VydmljZS1wcmluY2lwYWwtaWQ6c2VydmljZS1wcmluY2lwYWwtc2VjcmV0");
+    expect(String(fetcher.mock.calls[1]?.[0])).toContain("/api/2.0/fs/files/Volumes/main/default/storyverse_assets/images/world-1/cover.png");
+    expect(new Headers(fetcher.mock.calls[1]?.[1]?.headers).get("authorization")).toBe("Bearer oauth-access-token");
+    expect(new Headers(fetcher.mock.calls[2]?.[1]?.headers).get("authorization")).toBe("Bearer oauth-access-token");
+  });
+
+  it("refreshes a rejected OAuth token once without exposing client credentials", async () => {
+    const fetcher = vi.fn<typeof fetch>()
+      .mockResolvedValueOnce(new Response(JSON.stringify({ access_token: "first-token", expires_in: 3600 }), { status: 200, headers: { "content-type": "application/json" } }))
+      .mockResolvedValueOnce(new Response(null, { status: 401 }))
+      .mockResolvedValueOnce(new Response(JSON.stringify({ access_token: "second-token", expires_in: 3600 }), { status: 200, headers: { "content-type": "application/json" } }))
+      .mockResolvedValueOnce(new Response(null, { status: 204 }));
+    const tokenProvider = new DatabricksOAuthM2MTokenProvider({
+      host: "workspace.cloud.databricks.com",
+      clientId: "test-client",
+      clientSecret: "test-secret-never-in-errors",
+      fetch: fetcher,
+    });
+    const store = new DatabricksVolumeAssetStore({
+      host: "workspace.cloud.databricks.com",
+      volumePath: "/Volumes/main/default/storyverse_assets",
+      tokenProvider,
+      fetch: fetcher,
+    });
+
+    await expect(store.put("images/world-1/cover.png", new Uint8Array([1]), "image/png")).resolves.toBeUndefined();
+
+    expect(fetcher).toHaveBeenCalledTimes(4);
+    expect(new Headers(fetcher.mock.calls[1]?.[1]?.headers).get("authorization")).toBe("Bearer first-token");
+    expect(new Headers(fetcher.mock.calls[3]?.[1]?.headers).get("authorization")).toBe("Bearer second-token");
+  });
+
+  it("contains OAuth credential and provider-response details on token failures", async () => {
+    const fetcher = vi.fn<typeof fetch>().mockResolvedValue(new Response('{"error":"test-client-secret must not leak"}', { status: 401 }));
+    const provider = new DatabricksOAuthM2MTokenProvider({
+      host: "workspace.cloud.databricks.com",
+      clientId: "test-client-id",
+      clientSecret: "test-client-secret",
+      fetch: fetcher,
+    });
+
+    const error = await provider.getAccessToken().catch((failure: unknown) => failure);
+
+    expect(error).toMatchObject({ code: "provider_error", status: 401 } satisfies Partial<AssetStoreError>);
+    expect((error as Error).message).not.toContain("test-client-secret");
+  });
 });
 
 describe("createAssetStoreFromEnvironment", () => {
-  it("defaults to a local store and only selects Databricks when explicitly configured", () => {
+  it("defaults to a local store and selects Databricks with either static or OAuth M2M credentials", async () => {
     expect(createAssetStoreFromEnvironment({ environment: {}, localDirectory: "/tmp/storyverse-assets" })).toBeInstanceOf(LocalAssetStore);
     expect(createAssetStoreFromEnvironment({
       environment: {
@@ -132,10 +206,40 @@ describe("createAssetStoreFromEnvironment", () => {
       },
       fetch: vi.fn<typeof fetch>(),
     })).toBeInstanceOf(DatabricksVolumeAssetStore);
+    const fetcher = vi.fn<typeof fetch>()
+      .mockResolvedValueOnce(new Response(JSON.stringify({ access_token: "oauth-access-token", expires_in: 3600 }), { status: 200, headers: { "content-type": "application/json" } }))
+      .mockResolvedValueOnce(new Response(null, { status: 200 }));
+    const oauthStore = createAssetStoreFromEnvironment({
+      environment: {
+        STORYVERSE_ASSET_STORAGE: "databricks-volume",
+        DATABRICKS_HOST: "workspace.cloud.databricks.com",
+        DATABRICKS_CLIENT_ID: "service-principal-id",
+        DATABRICKS_CLIENT_SECRET: "service-principal-secret",
+        DATABRICKS_VOLUME_PATH: "/Volumes/main/default/storyverse_assets",
+      },
+      fetch: fetcher,
+    });
+    expect(oauthStore).toBeInstanceOf(DatabricksVolumeAssetStore);
+    await expect(oauthStore.exists("images/world-1/cover.png")).resolves.toBe(true);
+    expect(fetcher).toHaveBeenCalledTimes(2);
   });
 
   it("fails closed for missing Databricks configuration or an unsupported provider", () => {
     expect(() => createAssetStoreFromEnvironment({ environment: { STORYVERSE_ASSET_STORAGE: "databricks" } })).toThrow(/DATABRICKS_HOST/);
+    expect(() => createAssetStoreFromEnvironment({ environment: {
+      STORYVERSE_ASSET_STORAGE: "databricks", DATABRICKS_HOST: "workspace.cloud.databricks.com",
+      DATABRICKS_VOLUME_PATH: "/Volumes/main/default/storyverse_assets", DATABRICKS_CLIENT_ID: "only-one-credential",
+    } })).toThrow(/both DATABRICKS_CLIENT_ID and DATABRICKS_CLIENT_SECRET/);
+    expect(() => createAssetStoreFromEnvironment({ environment: {
+      STORYVERSE_ASSET_STORAGE: "databricks", DATABRICKS_HOST: "workspace.cloud.databricks.com",
+      DATABRICKS_VOLUME_PATH: "/Volumes/main/default/storyverse_assets", DATABRICKS_TOKEN: "legacy-token",
+      DATABRICKS_CLIENT_ID: "service-principal-id", DATABRICKS_CLIENT_SECRET: "service-principal-secret",
+    } })).toThrow(/either DATABRICKS_TOKEN/);
+    expect(() => createAssetStoreFromEnvironment({ environment: {
+      STORYVERSE_ASSET_STORAGE: "databricks", DATABRICKS_HOST: "workspace.cloud.databricks.com",
+      DATABRICKS_VOLUME_PATH: "/Volumes/main/default/storyverse_assets", DATABRICKS_CLIENT_ID: " service-principal-id",
+      DATABRICKS_CLIENT_SECRET: "service-principal-secret",
+    } })).toThrow(/DATABRICKS_CLIENT_ID/);
     expect(() => createAssetStoreFromEnvironment({ environment: { STORYVERSE_ASSET_STORAGE: "s3" } })).toThrow(/STORYVERSE_ASSET_STORAGE/);
   });
 });

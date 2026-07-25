@@ -48,7 +48,9 @@ StoryVerse now has a portable persistence boundary:
 - **Concurrent production traffic:** PostgreSQL with optimistic story-version writes, transactional timeline rollback, and cross-instance image-cache reservation.
 - **Databricks:** Lakebase PostgreSQL for transactional world state and a private Unity Catalog Volume for generated images and narration through the Databricks Files API.
 
-Set `DATABASE_URL` (or standard `PG*` values) to select PostgreSQL; otherwise SQLite remains the default. Set `STORYVERSE_ASSET_STORAGE=databricks-volume` together with `DATABRICKS_HOST`, `DATABRICKS_TOKEN`, and `DATABRICKS_VOLUME_PATH` to move media into a Unity Catalog Volume. No database or storage credential reaches the client.
+Set `DATABASE_URL` (or standard `PG*` values) to select PostgreSQL; otherwise SQLite remains the default. To move media into a Unity Catalog Volume, set `STORYVERSE_ASSET_STORAGE=databricks-volume`, `DATABRICKS_HOST`, `DATABRICKS_VOLUME_PATH`, and—preferably for production—managed-secret `DATABRICKS_CLIENT_ID` plus `DATABRICKS_CLIENT_SECRET`.
+
+StoryVerse exchanges those service-principal credentials for cached workspace OAuth tokens at `<DATABRICKS_HOST>/oidc/v1/token`; the workspace Files API does not require `DATABRICKS_ACCOUNT_ID`. `DATABRICKS_TOKEN` remains a mutually exclusive compatibility fallback for short-lived local/PAT testing, not the recommended production credential. No database or storage credential reaches the client.
 
 See [the deployment guide](docs/deployment.md) for local Docker PostgreSQL testing, Lakebase/Volume preparation, Databricks Apps deployment, security notes, and smoke-test steps.
 
