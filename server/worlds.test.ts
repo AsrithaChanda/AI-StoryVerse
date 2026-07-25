@@ -21,6 +21,36 @@ describe("world archive", () => {
     expect(store.list()).toHaveLength(1);
   });
 
+  it("deletes only the selected world's story and database image records", () => {
+    const store = new WorldStore(new DatabaseSync(":memory:"));
+    const target = createWorld(store, "Delete Me");
+    const survivor = createWorld(store, "Keep Me");
+    const timestamp = "2026-01-01T00:00:00.000Z";
+    const saveStory = (worldId: string) => store.saveWorldStory({
+      worldId, characters: [], chapters: [], perspectives: [],
+      source: "fallback", createdAt: timestamp, updatedAt: timestamp,
+      worldState: "A saved state that belongs only to this world.",
+    });
+    const reserveImage = (worldId: string) => store.reserveStoryImage({
+      cacheKey: `image-${worldId}`, worldId, sceneId: "chapter-1-beat-1",
+      characterIds: [], promptVersion: "test", prompt: "A test image.",
+      fallbackUrl: "data:image/svg+xml;base64,",
+    });
+    saveStory(target.id);
+    saveStory(survivor.id);
+    reserveImage(target.id);
+    reserveImage(survivor.id);
+
+    expect(store.deleteWorld(target.id)).toBe(true);
+    expect(store.get(target.id)).toBeNull();
+    expect(store.getWorldStory(target.id)).toBeNull();
+    expect(store.findStoryImage(target.id, "chapter-1-beat-1")).toBeNull();
+    expect(store.get(survivor.id)?.title).toBe("Keep Me");
+    expect(store.getWorldStory(survivor.id)).not.toBeNull();
+    expect(store.findStoryImage(survivor.id, "chapter-1-beat-1")).not.toBeNull();
+    expect(store.deleteWorld("missing-world")).toBe(false);
+  });
+
   it("keeps offline world blueprints free of invented character records", async () => {
     vi.stubEnv("OPENAI_API_KEY", "");
     const generated = await generateWorld({ title: "Hollow Atlas", genre: "Science fantasy", premise: "Maps change the terrain.", creatorPrompt: "Vivid and intimate." });

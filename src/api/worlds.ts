@@ -23,3 +23,7 @@ export async function listWorlds(): Promise<World[]> { return (await request<{ w
 export async function createWorld(input: CreateWorldInput): Promise<World> {
   return (await request<{ world: World }>("/api/worlds", { method: "POST", body: JSON.stringify(input) })).world;
 }
+
+export async function deleteWorld(worldId: string): Promise<void> {
+  await request<{ deleted: true }>(`/api/worlds/${encodeURIComponent(worldId)}`, { method: "DELETE" });
+}

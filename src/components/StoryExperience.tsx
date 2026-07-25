@@ -9,6 +9,7 @@ type Props = {
   worldsLoading?: boolean;
   worldError?: string;
   createWorld?(input: CreateWorldInput): Promise<void>;
+  deleteWorld?(world: World): Promise<void>;
   selectWorld?(world: World): void;
   selectedWorld?: World | null;
   closeWorld?(): void;
@@ -54,6 +55,7 @@ export default function StoryExperience({
   worldsLoading = false,
   worldError,
   createWorld,
+  deleteWorld,
   selectWorld,
   selectedWorld,
   closeWorld,
@@ -61,7 +63,11 @@ export default function StoryExperience({
   retryWorldCover,
 }: Props) {
   const [creatorOpen, setCreatorOpen] = useState(false);
+  const [worldPendingDeletion, setWorldPendingDeletion] = useState<World | null>(null);
+  const [deletingWorld, setDeletingWorld] = useState(false);
+  const [deleteError, setDeleteError] = useState<string>();
   const creatorTrigger = useRef<HTMLButtonElement | null>(null);
+  const deleteTrigger = useRef<HTMLButtonElement | null>(null);
   const createdWorlds = worlds;
 
   const openCreator = (trigger: HTMLButtonElement) => {
@@ -73,6 +79,35 @@ export default function StoryExperience({
   const closeCreator = () => {
     setCreatorOpen(false);
     window.setTimeout(() => creatorTrigger.current?.focus(), 0);
+  };
+
+  const requestWorldDeletion = (world: World, trigger: HTMLButtonElement) => {
+    if (!deleteWorld) return;
+    deleteTrigger.current = trigger;
+    setDeleteError(undefined);
+    setWorldPendingDeletion(world);
+  };
+
+  const closeWorldDeletion = () => {
+    if (deletingWorld) return;
+    setWorldPendingDeletion(null);
+    setDeleteError(undefined);
+    window.setTimeout(() => deleteTrigger.current?.focus(), 0);
+  };
+
+  const confirmWorldDeletion = async () => {
+    if (!deleteWorld || !worldPendingDeletion || deletingWorld) return;
+    setDeletingWorld(true);
+    setDeleteError(undefined);
+    try {
+      await deleteWorld(worldPendingDeletion);
+      setWorldPendingDeletion(null);
+      window.setTimeout(() => deleteTrigger.current?.focus(), 0);
+    } catch (reason) {
+      setDeleteError(reason instanceof Error ? reason.message : "This world could not be deleted. Please try again.");
+    } finally {
+      setDeletingWorld(false);
+    }
   };
 
   const exploreWorlds = () => {
@@ -171,7 +206,7 @@ export default function StoryExperience({
             <p className="world-atlas-card__genre">{world.genre}</p>
             <h3>{world.title}</h3>
             <p>{world.premise}</p>
-            <footer><small>{formatCreatedAt(world.createdAt)}</small><button type="button" onClick={() => selectWorld?.(world)}>Open world <span aria-hidden="true">→</span></button></footer>
+            <footer><small>{formatCreatedAt(world.createdAt)}</small><div className="world-atlas-card__actions"><button type="button" onClick={() => selectWorld?.(world)}>Open world <span aria-hidden="true">→</span></button>{deleteWorld && <button className="world-atlas-card__delete" type="button" onClick={(event) => requestWorldDeletion(world, event.currentTarget)}>Delete</button>}</div></footer>
           </div>
         </article>)}
       </div>}
@@ -180,6 +215,7 @@ export default function StoryExperience({
     <footer className="product-home__footer"><span className="mark">SV</span><p>StoryVerse · persistent, cinematic storytelling.</p><button type="button" onClick={() => window.scrollTo({ top: 0, behavior: "smooth" })}>Back to top ↑</button></footer>
 
     {creatorOpen && createWorld && <WorldCreator close={closeCreator} submit={async (input) => { await createWorld(input); closeCreator(); }} />}
+    {worldPendingDeletion && <WorldDeletionDialog world={worldPendingDeletion} deleting={deletingWorld} error={deleteError} close={closeWorldDeletion} confirm={() => void confirmWorldDeletion()} />}
   </main>;
 }
 
@@ -221,6 +257,30 @@ function WorldCreator({ close, submit }: { close(): void; submit(input: CreateWo
         {error && <p className="form-error" role="alert">{error}</p>}
         <button className="product-home__create world-creator__submit" disabled={saving} type="submit">{saving ? "Creating your world…" : <>Create world <span aria-hidden="true">→</span></>}</button>
       </form>
+    </section>
+  </div>;
+}
+
+function WorldDeletionDialog({ world, deleting, error, close, confirm }: { world: World; deleting: boolean; error?: string; close(): void; confirm(): void }) {
+  const keepWorldButton = useRef<HTMLButtonElement>(null);
+
+  useEffect(() => {
+    keepWorldButton.current?.focus();
+  }, []);
+
+  useEffect(() => {
+    const handleKeyDown = (event: KeyboardEvent) => { if (event.key === "Escape" && !deleting) close(); };
+    window.addEventListener("keydown", handleKeyDown);
+    return () => window.removeEventListener("keydown", handleKeyDown);
+  }, [close, deleting]);
+
+  return <div className="drawer-backdrop world-delete-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget && !deleting) close(); }}>
+    <section className="world-delete-dialog" role="alertdialog" aria-modal="true" aria-labelledby="world-delete-title" aria-describedby="world-delete-description">
+      <p className="product-kicker"><span /> PERMANENT ACTION</p>
+      <h2 id="world-delete-title">Delete <em>{world.title}</em>?</h2>
+      <p id="world-delete-description">This permanently removes the world, its saved chapters, character perspectives, and image records. It cannot be undone.</p>
+      {error && <p className="form-error" role="alert">{error}</p>}
+      <div className="world-delete-dialog__actions"><button ref={keepWorldButton} type="button" onClick={close} disabled={deleting}>Keep world</button><button className="world-delete-dialog__confirm" type="button" onClick={confirm} disabled={deleting}>{deleting ? "Deleting world…" : "Delete permanently"}</button></div>
     </section>
   </div>;
 }

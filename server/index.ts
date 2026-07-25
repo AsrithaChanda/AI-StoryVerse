@@ -32,6 +32,11 @@ app.get("/api/worlds/:id", (request, response) => {
   const world = store.get(request.params.id);
   return world ? response.json({ world }) : response.status(404).json({ error: "World not found" });
 });
+app.delete("/api/worlds/:id", (request, response) => {
+  const deletedId = request.params.id;
+  if (!store.deleteWorld(deletedId)) return response.status(404).json({ error: "World not found" });
+  return response.json({ deleted: true, deletedId });
+});
 app.post("/api/worlds", async (request, response) => {
   if (!validInput(request.body)) return response.status(400).json({ error: "title, premise, genre, and creatorPrompt must each be 3–1000 characters" });
   try {

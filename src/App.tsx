@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { createWorld, listWorlds, type CreateWorldInput, type World } from "./api/worlds";
+import { createWorld, deleteWorld as deleteWorldRequest, listWorlds, type CreateWorldInput, type World } from "./api/worlds";
 import StoryExperience from "./components/StoryExperience";
 import { generateWorldCover, loadWorldCover } from "./images/api";
 import { worldIdFromSearch, worldRoute } from "./world-route";
@@ -39,6 +39,12 @@ export default function App() {
     openWorld(world);
   };
 
+  const handleDeleteWorld = async (world: World): Promise<void> => {
+    await deleteWorldRequest(world.id);
+    setWorlds((current) => current.filter((candidate) => candidate.id !== world.id));
+    if (selectedWorldId === world.id) closeWorld();
+  };
+
   const openWorld = (world: World) => {
     setSelectedWorldId(world.id);
     window.history.pushState({ worldId: world.id }, "", worldRoute(window.location, world.id));
@@ -62,6 +68,7 @@ export default function App() {
     worldsLoading={worldsLoading}
     worldError={worldError}
     createWorld={handleCreateWorld}
+    deleteWorld={handleDeleteWorld}
     selectWorld={openWorld}
     selectedWorld={selectedWorld}
     closeWorld={closeWorld}

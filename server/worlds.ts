@@ -77,12 +77,15 @@ export class WorldStore {
    * including worlds with similar titles or genres, are untouched.
    */
   private removeLegacySeededWorld(): void {
+    this.inTransaction(() => this.deleteWorldRecords(LEGACY_SEEDED_WORLD_ID));
+  }
+
+  private inTransaction<T>(operation: () => T): T {
     this.db.exec("BEGIN");
     try {
-      this.db.prepare("DELETE FROM story_images WHERE world_id = ?").run(LEGACY_SEEDED_WORLD_ID);
-      this.db.prepare("DELETE FROM world_stories WHERE world_id = ?").run(LEGACY_SEEDED_WORLD_ID);
-      this.db.prepare("DELETE FROM worlds WHERE id = ?").run(LEGACY_SEEDED_WORLD_ID);
+      const result = operation();
       this.db.exec("COMMIT");
+      return result;
     } catch (error) {
       try {
         this.db.exec("ROLLBACK");
@@ -91,6 +94,13 @@ export class WorldStore {
       }
       throw error;
     }
+  }
+
+  /** Deletes the relational records for one known world; callers own the transaction. */
+  private deleteWorldRecords(worldId: string): void {
+    this.db.prepare("DELETE FROM story_images WHERE world_id = ?").run(worldId);
+    this.db.prepare("DELETE FROM world_stories WHERE world_id = ?").run(worldId);
+    this.db.prepare("DELETE FROM worlds WHERE id = ?").run(worldId);
   }
 
   /** Removes the former canned fallback prose/cast from already-created worlds. */
@@ -130,6 +140,20 @@ export class WorldStore {
     const world: World = { id: `${slug(input.title)}-${randomUUID().slice(0, 8)}`, ...input, ...generated, createdAt: new Date().toISOString() };
     this.insert(world);
     return world;
+  }
+
+  /**
+   * Delete one persisted world and only its database-owned dependent records.
+   * Local image assets are intentionally not removed: their filenames are
+   * content-addressed and do not safely map back to a single world.
+   */
+  public deleteWorld(worldId: string): boolean {
+    return this.inTransaction(() => {
+      const existing = this.db.prepare("SELECT 1 FROM worlds WHERE id = ?").get(worldId);
+      if (!existing) return false;
+      this.deleteWorldRecords(worldId);
+      return true;
+    });
   }
 
   public getWorldStory(worldId: string): WorldStory | null {
