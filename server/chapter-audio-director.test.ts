@@ -5,6 +5,7 @@ import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { ChapterAudioDirector } from "./chapter-audio-director.js";
 import type { WorldStory } from "./story.js";
+import type { AssetStore, StoredAsset } from "./storage/index.js";
 import { WorldStore, type World } from "./worlds.js";
 
 function createTestWorld(store: WorldStore): World {
@@ -37,7 +38,7 @@ describe("chapter audio director", () => {
     await Promise.all(temporaryDirectories.splice(0).map((directory) => rm(directory, { recursive: true, force: true })));
   });
 
-  it("couples an emotion-selected local BGM with an explicit narrator persona", () => {
+  it("couples an emotion-selected local BGM with an explicit narrator persona", async () => {
     const store = new WorldStore(new DatabaseSync(":memory:"));
     const world = createTestWorld(store);
     const story: WorldStory = {
@@ -51,11 +52,11 @@ describe("chapter audio director", () => {
       chapters: [{ id: "chapter-1", number: 1, title: "Test pursuit", narration: "The test group attacks through thunder while moving across the test route.", beats: [] }],
     };
     store.saveWorldStory(story);
-    const plan = new ChapterAudioDirector(store).plan(world.id, "chapter-1");
+    const plan = await new ChapterAudioDirector(store).plan(world.id, "chapter-1");
     expect(plan).toMatchObject({ mood: "conflict", bgm: { id: "urgent", url: "/bgm/urgent.mp3" }, narrator: { genderPresentation: "neutral", ageTone: "mature", voice: "sage" } });
   });
 
-  it("uses the selected character, rather than the world genre, for POV voice presentation", () => {
+  it("uses the selected character, rather than the world genre, for POV voice presentation", async () => {
     const store = new WorldStore(new DatabaseSync(":memory:"));
     const world = createTestWorld(store);
     const story: WorldStory = {
@@ -76,12 +77,12 @@ describe("chapter audio director", () => {
     };
     store.saveWorldStory(story);
     const director = new ChapterAudioDirector(store);
-    expect(director.plan(world.id, "chapter-1", "character-feminine")?.narrator).toMatchObject({ genderPresentation: "feminine", voice: "coral" });
-    expect(director.plan(world.id, "chapter-1", "character-masculine")?.narrator).toMatchObject({ genderPresentation: "masculine", voice: "onyx" });
-    expect(director.plan(world.id, "chapter-1", "character-feminine")).toMatchObject({ narrationSource: { kind: "character", label: "Test Character Feminine's perspective" }, narrationText: "I observe the test route." });
+    expect((await director.plan(world.id, "chapter-1", "character-feminine"))?.narrator).toMatchObject({ genderPresentation: "feminine", voice: "coral" });
+    expect((await director.plan(world.id, "chapter-1", "character-masculine"))?.narrator).toMatchObject({ genderPresentation: "masculine", voice: "onyx" });
+    expect(await director.plan(world.id, "chapter-1", "character-feminine")).toMatchObject({ narrationSource: { kind: "character", label: "Test Character Feminine's perspective" }, narrationText: "I observe the test route." });
   });
 
-  it("uses the model-authored chapter direction before the keyword fallback", () => {
+  it("uses the model-authored chapter direction before the keyword fallback", async () => {
     const store = new WorldStore(new DatabaseSync(":memory:"));
     const world = createTestWorld(store);
     const story: WorldStory = {
@@ -95,7 +96,7 @@ describe("chapter audio director", () => {
       chapters: [{ id: "chapter-1", number: 1, title: "Test activity", narration: "The test group attacks through thunder.", beats: [], audioDirection: { primaryEmotion: "grief", secondaryEmotion: "reflection", intensity: 0.8, bgmCue: "grief", narrationDelivery: "restrained and sorrowful" } }],
     };
     store.saveWorldStory(story);
-    expect(new ChapterAudioDirector(store).plan(world.id, "chapter-1")).toMatchObject({ mood: "grief", bgm: { id: "transmission" }, narrator: { delivery: "restrained and sorrowful" } });
+    expect(await new ChapterAudioDirector(store).plan(world.id, "chapter-1")).toMatchObject({ mood: "grief", bgm: { id: "transmission" }, narrator: { delivery: "restrained and sorrowful" } });
   });
 
   it("sends the exact selected POV prose to the dedicated speech endpoint", async () => {
@@ -119,12 +120,50 @@ describe("chapter audio director", () => {
     const fetchMock = vi.fn().mockResolvedValue(new Response(new Uint8Array(44), { status: 200 }));
     vi.stubGlobal("fetch", fetchMock);
 
-    const plan = new ChapterAudioDirector(store, directory).plan(world.id, "chapter-1", "character-feminine");
+    const plan = await new ChapterAudioDirector(store, directory).plan(world.id, "chapter-1", "character-feminine");
     const narration = await new ChapterAudioDirector(store, directory).narrate(plan!);
     const request = fetchMock.mock.calls[0]?.[1] as RequestInit;
 
     expect(narration.status).toBe("ready");
     expect(fetchMock.mock.calls[0]?.[0]).toBe("https://api.openai.com/v1/audio/speech");
     expect(JSON.parse(String(request.body))).toMatchObject({ model: "gpt-4o-mini-tts", voice: "coral", input: "I observe the test route from the rain.", response_format: "wav" });
+  });
+
+  it("persists narration through an injected object-store namespace and reuses it", async () => {
+    const store = new WorldStore(new DatabaseSync(":memory:"));
+    const world = createTestWorld(store);
+    const story: WorldStory = {
+      worldId: world.id,
+      source: "openai",
+      createdAt: "now",
+      updatedAt: "now",
+      worldState: "The test route is ready for narration.",
+      chapters: [{ id: "chapter-1", number: 1, title: "Test choice", narration: "The stored test narration is read exactly once.", beats: [] }],
+      characters: [],
+      perspectives: [],
+    };
+    store.saveWorldStory(story);
+    const objects = new Map<string, StoredAsset>();
+    const objectStore: AssetStore = {
+      put: async (key, bytes, contentType) => { objects.set(key, { bytes, contentType }); },
+      exists: async (key) => objects.has(key),
+      read: async (key) => objects.get(key) ?? null,
+    };
+    process.env.OPENAI_API_KEY = "test-key";
+    const fetchMock = vi.fn().mockResolvedValue(new Response(new Uint8Array(44), { status: 200 }));
+    vi.stubGlobal("fetch", fetchMock);
+    const director = new ChapterAudioDirector(store, objectStore, "narrations");
+    const plan = await director.plan(world.id, "chapter-1");
+    if (!plan) throw new Error("Expected audio plan");
+
+    const first = await director.narrate(plan);
+    const second = await director.narrate(plan);
+
+    expect(first.status).toBe("ready");
+    expect(second.status).toBe("ready");
+    if (!first.audioUrl) throw new Error("Expected saved narration URL");
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect([...objects.keys()]).toEqual([`narrations/${first.audioUrl.split("/").at(-1)}`]);
+    expect([...objects.values()][0]?.contentType).toBe("audio/wav");
   });
 });

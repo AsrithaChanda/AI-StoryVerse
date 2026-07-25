@@ -1,0 +1,306 @@
+import { describe, expect, it } from "vitest";
+import { DatabaseSync } from "node:sqlite";
+import type { NewStoryImage } from "../images/types.js";
+import type { WorldStory } from "../story.js";
+import { WorldStore } from "../worlds.js";
+import {
+  PostgresWorldStore,
+  postgresConfigFromEnv,
+  type PgClient,
+  type PgPool,
+  type PgQueryResult,
+} from "./postgres.js";
+import type { StoryStore } from "./store.js";
+
+type QueryCall = { text: string; values: readonly unknown[] | undefined };
+type QueryHandler = (call: QueryCall) => PgQueryResult<Record<string, unknown>> | Promise<PgQueryResult<Record<string, unknown>>>;
+
+class RecordingPool implements PgPool {
+  public readonly calls: QueryCall[] = [];
+  public connections = 0;
+  public releases = 0;
+
+  public constructor(private readonly handler: QueryHandler = () => ({ rows: [], rowCount: 0 })) {}
+
+  public async query<Row extends Record<string, unknown> = Record<string, unknown>>(
+    text: string,
+    values?: readonly unknown[],
+  ): Promise<PgQueryResult<Row>> {
+    const call = { text: text.replace(/\s+/g, " ").trim(), values };
+    this.calls.push(call);
+    return this.handler(call) as PgQueryResult<Row>;
+  }
+
+  public async connect(): Promise<PgClient> {
+    this.connections += 1;
+    return {
+      query: this.query.bind(this),
+      release: () => { this.releases += 1; },
+    };
+  }
+}
+
+const fixedNow = () => new Date("2026-07-26T10:00:00.000Z");
+const testOptions = { now: fixedNow, createId: () => "00000000-0000-4000-8000-000000000001" };
+
+function includes(call: QueryCall, fragment: string): boolean {
+  return call.text.includes(fragment);
+}
+
+async function initializedStore(pool: RecordingPool): Promise<PostgresWorldStore> {
+  const store = new PostgresWorldStore(pool, testOptions);
+  await store.initialize();
+  pool.calls.length = 0;
+  return store;
+}
+
+function chapter(number: number) {
+  return {
+    id: `chapter-${number}`,
+    number,
+    title: `Chapter ${number}`,
+    narration: `Chapter ${number} carries enough narrative detail for persistence tests.`,
+    beats: [{ id: `chapter-${number}-beat-1`, description: `Visual beat ${number}`, caption: `Beat ${number}` }],
+  };
+}
+
+function testStory(): WorldStory {
+  return {
+    worldId: "world-1",
+    characters: [
+      { id: "mira", name: "Mira", role: "Lead", visualDescription: "Blue coat", personality: "Brave", goal: "Protect the city", memories: [], introducedInChapter: "chapter-1" },
+      { id: "ravi", name: "Ravi", role: "New ally", visualDescription: "Green coat", personality: "Careful", goal: "Find the signal", memories: [], introducedInChapter: "chapter-2" },
+    ],
+    chapters: [chapter(1), chapter(2), chapter(3)],
+    perspectives: [{
+      characterId: "ravi",
+      chapterId: "chapter-3",
+      narration: "Ravi sees the last chapter differently.",
+      beats: [{ id: "chapter-3-ravi-beat-1", description: "Ravi visual", caption: "Ravi" }],
+    }],
+    upcomingDirections: ["Keep the signal unresolved."],
+    worldState: "The city stays guarded while its signal grows louder each night.",
+    source: "openai",
+    createdAt: "2026-07-26T09:00:00.000Z",
+    updatedAt: "2026-07-26T09:00:00.000Z",
+  };
+}
+
+function storyRow(story: WorldStory, version = 1): PgQueryResult<Record<string, unknown>> {
+  return { rows: [{ story_json: story, version }], rowCount: 1 };
+}
+
+function imageRow(overrides: Partial<Record<string, unknown>> = {}): Record<string, unknown> {
+  return {
+    id: "image-1",
+    cache_key: "image-key",
+    world_id: "world-1",
+    branch_id: null,
+    scene_id: "chapter-1-beat-1",
+    protagonist_id: null,
+    character_ids_json: [],
+    prompt_version: "v1",
+    prompt: "A cinematic test scene",
+    status: "pending",
+    image_url: null,
+    fallback_url: "data:image/svg+xml;base64,",
+    provider: null,
+    provider_asset_id: null,
+    error_code: null,
+    retry_count: 0,
+    created_at: "2026-07-26T10:00:00.000Z",
+    updated_at: "2026-07-26T10:00:00.000Z",
+    ...overrides,
+  };
+}
+
+describe("PostgresWorldStore configuration", () => {
+  it("keeps the existing synchronous SQLite store assignable to the async-capable contract", () => {
+    const sqlite: StoryStore = new WorldStore(new DatabaseSync(":memory:"));
+    expect(sqlite.list()).toEqual([]);
+  });
+
+  it("uses DATABASE_URL first and honors a TLS Lakebase-compatible connection string", () => {
+    const config = postgresConfigFromEnv({
+      DATABASE_URL: "postgresql://writer:secret@db.example.test:5432/storyverse?sslmode=require",
+      PGHOST: "should-not-be-used",
+      PGSSLMODE: "require",
+      STORYVERSE_PG_POOL_MAX: "14",
+    });
+    expect(config).toMatchObject({
+      connectionString: "postgresql://writer:secret@db.example.test:5432/storyverse?sslmode=require",
+      ssl: { rejectUnauthorized: true },
+      max: 14,
+    });
+    expect(config).not.toHaveProperty("host");
+  });
+
+  it("supports standard PG variables, explicit SSL disable, and leaves SQLite fallback available", () => {
+    expect(postgresConfigFromEnv({})).toBeNull();
+    expect(postgresConfigFromEnv({
+      PGHOST: "127.0.0.1",
+      PGPORT: "5433",
+      PGDATABASE: "storyverse",
+      PGUSER: "storyverse",
+      PGPASSWORD: "local-only",
+      PGSSLMODE: "disable",
+    })).toMatchObject({
+      host: "127.0.0.1",
+      port: 5433,
+      database: "storyverse",
+      user: "storyverse",
+    });
+    expect(postgresConfigFromEnv({
+      DATABASE_URL: "postgresql://writer@db.example.test/storyverse?sslmode=require",
+      DATABRICKS_OAUTH_TOKEN: "short-lived-smoke-test-token",
+    })).toMatchObject({
+      password: "short-lived-smoke-test-token",
+      ssl: { rejectUnauthorized: true },
+    });
+  });
+});
+
+describe("PostgresWorldStore migrations", () => {
+  it("runs one guarded schema migration for concurrent initialize calls", async () => {
+    const pool = new RecordingPool();
+    const store = new PostgresWorldStore(pool, testOptions);
+    await Promise.all([store.initialize(), store.initialize(), store.initialize()]);
+
+    expect(pool.connections).toBe(1);
+    expect(pool.calls.filter((call) => call.text === "BEGIN")).toHaveLength(1);
+    expect(pool.calls.some((call) => includes(call, "pg_advisory_xact_lock"))).toBe(true);
+    expect(pool.calls.some((call) => includes(call, "CREATE TABLE IF NOT EXISTS worlds"))).toBe(true);
+    expect(pool.calls.some((call) => includes(call, "CREATE TABLE IF NOT EXISTS world_stories"))).toBe(true);
+    expect(pool.calls.some((call) => includes(call, "CREATE TABLE IF NOT EXISTS story_images"))).toBe(true);
+    expect(pool.releases).toBe(1);
+  });
+
+  it("clears a failed initialization promise so a later attempt can recover", async () => {
+    let attempts = 0;
+    const pool = new RecordingPool((call) => {
+      if (includes(call, "pg_advisory_xact_lock")) {
+        attempts += 1;
+        if (attempts === 1) throw new Error("temporarily unavailable");
+      }
+      return { rows: [], rowCount: 0 };
+    });
+    const store = new PostgresWorldStore(pool, testOptions);
+    await expect(store.initialize()).rejects.toThrow("temporarily unavailable");
+    await expect(store.initialize()).resolves.toBeUndefined();
+    expect(pool.calls.filter((call) => call.text === "BEGIN")).toHaveLength(2);
+    expect(pool.calls.filter((call) => call.text === "ROLLBACK")).toHaveLength(1);
+  });
+});
+
+describe("PostgresWorldStore story concurrency and rollback", () => {
+  it("uses expected version compare-and-swap and returns null on a conflict", async () => {
+    const story = testStory();
+    const pool = new RecordingPool((call) => {
+      if (includes(call, "SELECT story_json, version FROM world_stories")) return storyRow(story, 4);
+      if (includes(call, "UPDATE world_stories")) return { rows: [], rowCount: 0 };
+      return { rows: [], rowCount: 0 };
+    });
+    const store = await initializedStore(pool);
+
+    await expect(store.saveWorldStory({ ...story, worldState: "Another draft tries to overwrite the current version." }, { expectedVersion: 4 })).resolves.toBeNull();
+    const update = pool.calls.find((call) => includes(call, "WHERE world_id = $1 AND version = $4"));
+    expect(update?.values?.at(-1)).toBe(4);
+  });
+
+  it("rolls back future chapters, introduced cast, POVs, and all removed chapter image namespaces atomically", async () => {
+    const story = testStory();
+    const pool = new RecordingPool((call) => {
+      if (includes(call, "SELECT story_json, version FROM world_stories WHERE world_id = $1 FOR UPDATE")) return storyRow(story, 7);
+      if (includes(call, "UPDATE world_stories")) return { rows: [{ version: 8 }], rowCount: 1 };
+      return { rows: [], rowCount: 0 };
+    });
+    const store = await initializedStore(pool);
+
+    const result = await store.deleteFutureChapters("world-1", "chapter-1");
+    expect(result).toMatchObject({ ok: true });
+    if (!result.ok) throw new Error("Expected deletion result");
+    expect(result.value.chapter.id).toBe("chapter-1");
+    expect(result.value.removedChapterIds).toEqual(["chapter-2", "chapter-3"]);
+    expect(result.value.story.chapters.map((item) => item.id)).toEqual(["chapter-1"]);
+    expect(result.value.story.characters.map((item) => item.id)).toEqual(["mira"]);
+    expect(result.value.story.perspectives).toEqual([]);
+    expect(result.value.story.upcomingDirections).toEqual(["Keep the signal unresolved."]);
+
+    const imageDelete = pool.calls.find((call) => includes(call, "DELETE FROM story_images"));
+    expect(imageDelete?.values).toEqual(["world-1", ["chapter-2", "chapter-3"], ["chapter-2-%", "chapter-3-%"]]);
+    const ordered = pool.calls.map((call) => call.text);
+    expect(ordered.findIndex((text) => text.includes("DELETE FROM story_images"))).toBeLessThan(ordered.findIndex((text) => text.includes("UPDATE world_stories")));
+    expect(ordered.at(-1)).toBe("COMMIT");
+  });
+
+  it("rolls database work back if the story compare-and-swap fails during timeline deletion", async () => {
+    const story = testStory();
+    const pool = new RecordingPool((call) => {
+      if (includes(call, "SELECT story_json, version FROM world_stories WHERE world_id = $1 FOR UPDATE")) return storyRow(story, 2);
+      if (includes(call, "UPDATE world_stories")) return { rows: [], rowCount: 0 };
+      return { rows: [], rowCount: 0 };
+    });
+    const store = await initializedStore(pool);
+
+    await expect(store.deleteLatestChapter("world-1", "chapter-3")).rejects.toThrow("Story changed while chapter rollback");
+    expect(pool.calls.some((call) => call.text === "ROLLBACK")).toBe(true);
+    expect(pool.calls.some((call) => call.text === "COMMIT")).toBe(false);
+  });
+});
+
+describe("PostgresWorldStore image cache", () => {
+  it("uses INSERT ON CONFLICT for cross-instance image reservations and returns the existing record", async () => {
+    const existing = imageRow({ status: "ready", image_url: "https://storage.example.test/scene.webp" });
+    const pool = new RecordingPool((call) => {
+      if (includes(call, "INSERT INTO story_images")) return { rows: [], rowCount: 0 };
+      if (includes(call, "SELECT * FROM story_images WHERE cache_key")) return { rows: [existing], rowCount: 1 };
+      return { rows: [], rowCount: 0 };
+    });
+    const store = await initializedStore(pool);
+    const input: NewStoryImage = {
+      cacheKey: "image-key",
+      worldId: "world-1",
+      sceneId: "chapter-1-beat-1",
+      characterIds: [],
+      promptVersion: "v1",
+      prompt: "A cinematic test scene",
+      fallbackUrl: "data:image/svg+xml;base64,",
+    };
+
+    const reserved = await store.reserveStoryImage(input);
+    expect(reserved).toMatchObject({ created: false, image: { status: "ready", imageUrl: "https://storage.example.test/scene.webp" } });
+    expect(pool.calls.find((call) => includes(call, "INSERT INTO story_images"))?.text).toContain("ON CONFLICT (cache_key) DO NOTHING RETURNING *");
+  });
+
+  it("returns the creating request's pending image record when INSERT succeeds", async () => {
+    const pool = new RecordingPool((call) => {
+      if (includes(call, "INSERT INTO story_images")) return { rows: [imageRow()], rowCount: 1 };
+      return { rows: [], rowCount: 0 };
+    });
+    const store = await initializedStore(pool);
+    const input: NewStoryImage = {
+      cacheKey: "image-key",
+      worldId: "world-1",
+      sceneId: "chapter-1-beat-1",
+      characterIds: [],
+      promptVersion: "v1",
+      prompt: "A cinematic test scene",
+      fallbackUrl: "data:image/svg+xml;base64,",
+    };
+    const reserved = await store.reserveStoryImage(input);
+    expect(reserved.created).toBe(true);
+    expect(reserved.image).toMatchObject({ status: "pending", cacheKey: "image-key" });
+  });
+});
+
+describe("PostgresWorldStore world deletion", () => {
+  it("uses a transaction and relies on schema foreign-key cascades for dependent rows", async () => {
+    const pool = new RecordingPool((call) => {
+      if (includes(call, "DELETE FROM worlds")) return { rows: [{ id: "world-1" }], rowCount: 1 };
+      return { rows: [], rowCount: 0 };
+    });
+    const store = await initializedStore(pool);
+    await expect(store.deleteWorld("world-1")).resolves.toBe(true);
+    expect(pool.calls.map((call) => call.text)).toEqual(["BEGIN", "DELETE FROM worlds WHERE id = $1 RETURNING id", "COMMIT"]);
+  });
+});

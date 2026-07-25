@@ -1,7 +1,21 @@
 import { Router, type Request, type Response } from "express";
 import { z } from "zod";
-import { generateInitialStory, generateNextChapter, generateNextChapterStream, generatePerspective, generatePerspectiveStream, MAX_UPCOMING_DIRECTIONS, reviseLatestChapter, reviseLatestChapterStream, type ChapterRevisionGeneration, type NextChapterGeneration, type StoryStreamCallbacks, type WorldStory } from "./story.js";
-import type { StoryChapterDeletionFailure, WorldStore } from "./worlds.js";
+import {
+  generateInitialStory,
+  generateNextChapter,
+  generateNextChapterStream,
+  generatePerspective,
+  generatePerspectiveStream,
+  MAX_UPCOMING_DIRECTIONS,
+  reviseLatestChapter,
+  reviseLatestChapterStream,
+  type ChapterRevisionGeneration,
+  type NextChapterGeneration,
+  type StoryStreamCallbacks,
+  type WorldStory,
+} from "./story.js";
+import type { StoryStore, VersionedStoryStore } from "./persistence/store.js";
+import type { StoryChapterDeletionFailure } from "./worlds.js";
 
 const id = z.string().trim().min(1).max(64).regex(/^[a-z0-9_-]+$/i);
 const commandSchema = z.object({ command: z.string().trim().min(3).max(1000) }).strict();
@@ -10,6 +24,7 @@ const directionSchema = z.object({ direction: z.string().trim().min(3).max(1000)
 const revisionSchema = z.object({ prompt: z.string().trim().min(3).max(1000) }).strict();
 
 type StreamPhase = { stage: "writing" | "validating" };
+type StorySnapshot = { story: WorldStory; version?: number };
 
 function beginSse(response: Response): void {
   response.status(200).set({
@@ -50,6 +65,24 @@ function chapterDeletionError(response: Response, reason: StoryChapterDeletionFa
   }
 }
 
+function isVersionedStore(store: StoryStore): store is VersionedStoryStore {
+  return "getWorldStoryRecord" in store && typeof store.getWorldStoryRecord === "function";
+}
+
+async function storySnapshot(store: StoryStore, worldId: string): Promise<StorySnapshot | null> {
+  if (isVersionedStore(store)) {
+    const record = await store.getWorldStoryRecord(worldId);
+    return record ? { story: record.story, version: record.version } : null;
+  }
+  const story = await store.getWorldStory(worldId);
+  return story ? { story } : null;
+}
+
+async function saveSnapshot(store: StoryStore, story: WorldStory, snapshot: StorySnapshot | null): Promise<WorldStory | null> {
+  if (isVersionedStore(store)) return store.saveWorldStory(story, { expectedVersion: snapshot?.version ?? 0 });
+  return store.saveWorldStory(story);
+}
+
 function appendGeneratedChapter(existing: WorldStory, generated: NextChapterGeneration): WorldStory {
   return {
     ...existing,
@@ -75,193 +108,220 @@ function replaceLatestChapter(existing: WorldStory, generated: ChapterRevisionGe
   };
 }
 
-export function createStoryRouter(store: WorldStore): Router {
+/**
+ * Shared HTTP layer for the local SQLite store and transactional PostgreSQL.
+ * Versioned stores use optimistic locking so two creators cannot silently
+ * overwrite the same story aggregate while model work is in flight.
+ */
+export function createStoryRouter(store: StoryStore): Router {
   const router = Router();
-  router.get("/worlds/:worldId/story", (request, response) => {
+
+  router.get("/worlds/:worldId/story", async (request, response) => {
     const worldId = id.safeParse(request.params.worldId);
     if (!worldId.success) return response.status(400).json({ error: "Invalid world identifier" });
-    const story = store.getWorldStory(worldId.data);
-    return story ? response.json({ story }) : response.status(404).json({ error: "Story has not been generated" });
+    const snapshot = await storySnapshot(store, worldId.data);
+    return snapshot ? response.json({ story: snapshot.story }) : response.status(404).json({ error: "Story has not been generated" });
   });
-  // Retain `chapterId` and remove every later chapter. The response always
-  // names the surviving canonical chapter that the reader should display.
-  router.delete("/worlds/:worldId/story/chapters/:chapterId/future", (request, response) => {
+
+  // Retain chapterId and atomically remove every later chapter.
+  router.delete("/worlds/:worldId/story/chapters/:chapterId/future", async (request, response) => {
     const worldId = id.safeParse(request.params.worldId);
     const chapterId = id.safeParse(request.params.chapterId);
     if (!worldId.success || !chapterId.success) return response.status(400).json({ error: "Invalid world or chapter identifier" });
-    if (!store.get(worldId.data)) return response.status(404).json({ error: "World not found" });
-    const result = store.deleteFutureChapters(worldId.data, chapterId.data);
+    if (!await store.get(worldId.data)) return response.status(404).json({ error: "World not found" });
+    const result = await store.deleteFutureChapters(worldId.data, chapterId.data);
     if (!result.ok) return chapterDeletionError(response, result.reason);
     return response.json({ story: result.value.story, chapter: result.value.chapter });
   });
-  // A single-chapter delete is deliberately constrained to the current end of
-  // the timeline, and Chapter 1 remains the immutable starting point.
-  router.delete("/worlds/:worldId/story/chapters/:chapterId", (request, response) => {
+
+  router.delete("/worlds/:worldId/story/chapters/:chapterId", async (request, response) => {
     const worldId = id.safeParse(request.params.worldId);
     const chapterId = id.safeParse(request.params.chapterId);
     if (!worldId.success || !chapterId.success) return response.status(400).json({ error: "Invalid world or chapter identifier" });
-    if (!store.get(worldId.data)) return response.status(404).json({ error: "World not found" });
-    const result = store.deleteLatestChapter(worldId.data, chapterId.data);
+    if (!await store.get(worldId.data)) return response.status(404).json({ error: "World not found" });
+    const result = await store.deleteLatestChapter(worldId.data, chapterId.data);
     if (!result.ok) return chapterDeletionError(response, result.reason);
     return response.json({ story: result.value.story, chapter: result.value.chapter });
   });
+
   router.post("/worlds/:worldId/story/bootstrap", async (request, response) => {
-    const world = store.get(request.params.worldId);
+    const world = await store.get(request.params.worldId);
     if (!world) return response.status(404).json({ error: "World not found" });
-    const existing = store.getWorldStory(world.id);
-    // Empty fallback records are intentionally retried when the user opens the
-    // world later (for example after adding a valid model key).
-    if (existing && existing.chapters.length > 0) return response.json({ story: existing });
+    const existing = await storySnapshot(store, world.id);
+    // Empty fallback records are retried after the creator configures a model.
+    if (existing && existing.story.chapters.length > 0) return response.json({ story: existing.story });
     const generated = await generateInitialStory(world);
     if (generated.chapters.length === 0) return response.status(503).json({ error: "Chapter 1 could not be generated. Check the server log for the safe provider status, then try again." });
-    const story = store.saveWorldStory(generated);
-    return response.json({ story });
+    const story = await saveSnapshot(store, generated, existing);
+    if (story) return response.json({ story });
+    // Another request can win an insert race. Returning its completed story
+    // makes bootstrap idempotent instead of presenting a false failure.
+    const concurrent = await storySnapshot(store, world.id);
+    if (concurrent?.story.chapters.length) return response.json({ story: concurrent.story });
+    return response.status(409).json({ error: "The story changed while Chapter 1 was being generated. Please retry." });
   });
-  router.post("/worlds/:worldId/story/directions", (request, response) => {
+
+  router.post("/worlds/:worldId/story/directions", async (request, response) => {
     const parsed = directionSchema.safeParse(request.body);
     if (!parsed.success) return response.status(400).json({ error: "A 3–1000 character upcoming direction is required" });
-    const world = store.get(request.params.worldId);
+    const world = await store.get(request.params.worldId);
     if (!world) return response.status(404).json({ error: "World not found" });
-    const existing = store.getWorldStory(world.id);
-    if (!existing) return response.status(409).json({ error: "Generate Chapter 1 first" });
+    const snapshot = await storySnapshot(store, world.id);
+    if (!snapshot) return response.status(409).json({ error: "Generate Chapter 1 first" });
     const direction = parsed.data.direction.replace(/\s+/g, " ");
-    const queued = existing.upcomingDirections ?? [];
-    if (queued.some((entry) => entry.toLocaleLowerCase() === direction.toLocaleLowerCase())) return response.json({ story: existing });
+    const queued = snapshot.story.upcomingDirections ?? [];
+    if (queued.some((entry) => entry.toLocaleLowerCase() === direction.toLocaleLowerCase())) return response.json({ story: snapshot.story });
     if (queued.length >= MAX_UPCOMING_DIRECTIONS) return response.status(409).json({ error: `You can queue up to ${MAX_UPCOMING_DIRECTIONS} directions before generating the next chapter` });
-    return response.json({ story: store.saveWorldStory({ ...existing, upcomingDirections: [...queued, direction] }) });
+    const story = await saveSnapshot(store, { ...snapshot.story, upcomingDirections: [...queued, direction] }, snapshot);
+    return story ? response.json({ story }) : response.status(409).json({ error: "The story changed while the direction was being saved. Reload and try again." });
   });
+
   router.post("/worlds/:worldId/story/revise", async (request, response) => {
     const parsed = revisionSchema.safeParse(request.body);
     if (!parsed.success) return response.status(400).json({ error: "A 3–1000 character revision prompt is required" });
-    const world = store.get(request.params.worldId);
+    const world = await store.get(request.params.worldId);
     if (!world) return response.status(404).json({ error: "World not found" });
-    const existing = store.getWorldStory(world.id);
-    if (!existing) return response.status(409).json({ error: "Generate Chapter 1 first" });
-    const generated = await reviseLatestChapter(world, existing, parsed.data.prompt);
+    const snapshot = await storySnapshot(store, world.id);
+    if (!snapshot) return response.status(409).json({ error: "Generate Chapter 1 first" });
+    const generated = await reviseLatestChapter(world, snapshot.story, parsed.data.prompt);
     if (!generated) return response.status(503).json({ error: "The current chapter could not be revised" });
-    const updated = replaceLatestChapter(existing, generated);
+    const updated = replaceLatestChapter(snapshot.story, generated);
     if (!updated) return response.status(409).json({ error: "The current chapter changed before the revision could be saved" });
-    const story = store.saveWorldStory(updated);
-    return response.json({ story, chapter: generated.chapter });
+    const story = await saveSnapshot(store, updated, snapshot);
+    return story ? response.json({ story, chapter: generated.chapter }) : response.status(409).json({ error: "The current chapter changed before the revision could be saved" });
   });
+
   router.post("/worlds/:worldId/story/revise/stream", async (request, response) => {
     const parsed = revisionSchema.safeParse(request.body);
     if (!parsed.success) return response.status(400).json({ error: "A 3–1000 character revision prompt is required" });
-    const world = store.get(request.params.worldId);
+    const world = await store.get(request.params.worldId);
     if (!world) return response.status(404).json({ error: "World not found" });
-    const existing = store.getWorldStory(world.id);
-    if (!existing) return response.status(409).json({ error: "Generate Chapter 1 first" });
+    const snapshot = await storySnapshot(store, world.id);
+    if (!snapshot) return response.status(409).json({ error: "Generate Chapter 1 first" });
     beginSse(response);
     writeSse(response, "phase", { stage: "writing" } satisfies StreamPhase);
-    const generated = await reviseLatestChapterStream(world, existing, parsed.data.prompt, storyStreamCallbacks(response));
+    const generated = await reviseLatestChapterStream(world, snapshot.story, parsed.data.prompt, storyStreamCallbacks(response));
     if (!generated) return streamError(response, "The current chapter could not be revised");
-    const updated = replaceLatestChapter(existing, generated);
+    const updated = replaceLatestChapter(snapshot.story, generated);
     if (!updated) return streamError(response, "The current chapter changed before the revision could be saved");
     try {
-      const story = store.saveWorldStory(updated);
-      streamComplete(response, { story, chapter: generated.chapter });
+      const story = await saveSnapshot(store, updated, snapshot);
+      if (!story) return streamError(response, "The current chapter changed before the revision could be saved");
+      return streamComplete(response, { story, chapter: generated.chapter });
     } catch {
-      streamError(response, "The current chapter could not be saved");
+      return streamError(response, "The current chapter could not be saved");
     }
   });
+
   router.post("/worlds/:worldId/story/next", async (request, response) => {
-    const world = store.get(request.params.worldId);
+    const world = await store.get(request.params.worldId);
     if (!world) return response.status(404).json({ error: "World not found" });
-    const existing = store.getWorldStory(world.id);
-    if (!existing) return response.status(409).json({ error: "Generate Chapter 1 first" });
-    const generated = await generateNextChapter(world, existing);
+    const snapshot = await storySnapshot(store, world.id);
+    if (!snapshot) return response.status(409).json({ error: "Generate Chapter 1 first" });
+    const generated = await generateNextChapter(world, snapshot.story);
     if (!generated) return response.status(503).json({ error: "The next chapter could not be generated" });
-    return response.json({ story: store.saveWorldStory(appendGeneratedChapter(existing, generated)) });
+    const story = await saveSnapshot(store, appendGeneratedChapter(snapshot.story, generated), snapshot);
+    return story ? response.json({ story }) : response.status(409).json({ error: "The story changed while the next chapter was being generated. Reload and try again." });
   });
+
   router.post("/worlds/:worldId/story/next/stream", async (request, response) => {
-    const world = store.get(request.params.worldId);
+    const world = await store.get(request.params.worldId);
     if (!world) return response.status(404).json({ error: "World not found" });
-    const existing = store.getWorldStory(world.id);
-    if (!existing) return response.status(409).json({ error: "Generate Chapter 1 first" });
+    const snapshot = await storySnapshot(store, world.id);
+    if (!snapshot) return response.status(409).json({ error: "Generate Chapter 1 first" });
     beginSse(response);
     writeSse(response, "phase", { stage: "writing" } satisfies StreamPhase);
-    const generated = await generateNextChapterStream(world, existing, storyStreamCallbacks(response));
+    const generated = await generateNextChapterStream(world, snapshot.story, storyStreamCallbacks(response));
     if (!generated) return streamError(response, "The next chapter could not be generated");
     try {
-      const story = store.saveWorldStory(appendGeneratedChapter(existing, generated));
-      streamComplete(response, { story, chapter: generated.chapter });
+      const story = await saveSnapshot(store, appendGeneratedChapter(snapshot.story, generated), snapshot);
+      if (!story) return streamError(response, "The story changed while the next chapter was being generated. Reload and try again.");
+      return streamComplete(response, { story, chapter: generated.chapter });
     } catch {
-      streamError(response, "The next chapter could not be saved");
+      return streamError(response, "The next chapter could not be saved");
     }
   });
+
   router.post("/worlds/:worldId/story/command", async (request, response) => {
     const parsed = commandSchema.safeParse(request.body);
     if (!parsed.success) return response.status(400).json({ error: "A 3–1000 character story command is required" });
-    const world = store.get(request.params.worldId);
+    const world = await store.get(request.params.worldId);
     if (!world) return response.status(404).json({ error: "World not found" });
-    const existing = store.getWorldStory(world.id);
-    if (!existing) return response.status(409).json({ error: "Generate Chapter 1 first" });
-    const generated = await generateNextChapter(world, existing, parsed.data.command);
+    const snapshot = await storySnapshot(store, world.id);
+    if (!snapshot) return response.status(409).json({ error: "Generate Chapter 1 first" });
+    const generated = await generateNextChapter(world, snapshot.story, parsed.data.command);
     if (!generated) return response.status(503).json({ error: "The command could not be applied" });
-    // The command is retained on the generated chapter for auditability, but
-    // must never leak into reader-facing world state or later model context.
-    return response.json({ story: store.saveWorldStory(appendGeneratedChapter(existing, generated)) });
+    const story = await saveSnapshot(store, appendGeneratedChapter(snapshot.story, generated), snapshot);
+    return story ? response.json({ story }) : response.status(409).json({ error: "The story changed while the command was being applied. Reload and try again." });
   });
+
   router.post("/worlds/:worldId/story/command/stream", async (request, response) => {
     const parsed = commandSchema.safeParse(request.body);
     if (!parsed.success) return response.status(400).json({ error: "A 3–1000 character story command is required" });
-    const world = store.get(request.params.worldId);
+    const world = await store.get(request.params.worldId);
     if (!world) return response.status(404).json({ error: "World not found" });
-    const existing = store.getWorldStory(world.id);
-    if (!existing) return response.status(409).json({ error: "Generate Chapter 1 first" });
+    const snapshot = await storySnapshot(store, world.id);
+    if (!snapshot) return response.status(409).json({ error: "Generate Chapter 1 first" });
     beginSse(response);
     writeSse(response, "phase", { stage: "writing" } satisfies StreamPhase);
-    const generated = await generateNextChapterStream(world, existing, storyStreamCallbacks(response), parsed.data.command);
+    const generated = await generateNextChapterStream(world, snapshot.story, storyStreamCallbacks(response), parsed.data.command);
     if (!generated) return streamError(response, "The command could not be applied");
     try {
-      const story = store.saveWorldStory(appendGeneratedChapter(existing, generated));
-      streamComplete(response, { story, chapter: generated.chapter });
+      const story = await saveSnapshot(store, appendGeneratedChapter(snapshot.story, generated), snapshot);
+      if (!story) return streamError(response, "The story changed while the command was being applied. Reload and try again.");
+      return streamComplete(response, { story, chapter: generated.chapter });
     } catch {
-      streamError(response, "The command could not be saved");
+      return streamError(response, "The command could not be saved");
     }
   });
+
   router.post("/worlds/:worldId/story/perspective", async (request: Request, response: Response) => {
     const parsed = characterSchema.safeParse(request.body);
     if (!parsed.success) return response.status(400).json({ error: "A valid character identifier is required" });
     const worldId = id.safeParse(request.params.worldId);
     if (!worldId.success) return response.status(400).json({ error: "Invalid world identifier" });
-    const world = store.get(worldId.data);
+    const world = await store.get(worldId.data);
     if (!world) return response.status(404).json({ error: "World not found" });
-    const existing = store.getWorldStory(world.id);
-    if (!existing) return response.status(409).json({ error: "Generate Chapter 1 first" });
-    const chapterId = existing.chapters.at(-1)?.id;
-    const cached = existing.perspectives.find((entry) => entry.characterId === parsed.data.characterId && entry.chapterId === chapterId);
-    const perspective = cached ?? await generatePerspective(world, existing, parsed.data.characterId);
+    const snapshot = await storySnapshot(store, world.id);
+    if (!snapshot) return response.status(409).json({ error: "Generate Chapter 1 first" });
+    const chapterId = snapshot.story.chapters.at(-1)?.id;
+    const cached = snapshot.story.perspectives.find((entry) => entry.characterId === parsed.data.characterId && entry.chapterId === chapterId);
+    const perspective = cached ?? await generatePerspective(world, snapshot.story, parsed.data.characterId);
     if (!perspective) return response.status(503).json({ error: "The character perspective could not be generated" });
-    const updated: WorldStory = cached ? existing : { ...existing, perspectives: [...existing.perspectives.filter((entry) => entry.chapterId !== chapterId || entry.characterId !== parsed.data.characterId), perspective] };
-    return response.json({ story: store.saveWorldStory(updated), perspective });
+    const updated: WorldStory = cached ? snapshot.story : { ...snapshot.story, perspectives: [...snapshot.story.perspectives.filter((entry) => entry.chapterId !== chapterId || entry.characterId !== parsed.data.characterId), perspective] };
+    if (cached) return response.json({ story: snapshot.story, perspective });
+    const story = await saveSnapshot(store, updated, snapshot);
+    return story ? response.json({ story, perspective }) : response.status(409).json({ error: "The story changed while this perspective was being generated. Reload and try again." });
   });
+
   router.post("/worlds/:worldId/story/perspective/stream", async (request: Request, response: Response) => {
     const parsed = characterSchema.safeParse(request.body);
     if (!parsed.success) return response.status(400).json({ error: "A valid character identifier is required" });
     const worldId = id.safeParse(request.params.worldId);
     if (!worldId.success) return response.status(400).json({ error: "Invalid world identifier" });
-    const world = store.get(worldId.data);
+    const world = await store.get(worldId.data);
     if (!world) return response.status(404).json({ error: "World not found" });
-    const existing = store.getWorldStory(world.id);
-    if (!existing) return response.status(409).json({ error: "Generate Chapter 1 first" });
-    const chapterId = existing.chapters.at(-1)?.id;
-    const cached = existing.perspectives.find((entry) => entry.characterId === parsed.data.characterId && entry.chapterId === chapterId);
+    const snapshot = await storySnapshot(store, world.id);
+    if (!snapshot) return response.status(409).json({ error: "Generate Chapter 1 first" });
+    const chapterId = snapshot.story.chapters.at(-1)?.id;
+    const cached = snapshot.story.perspectives.find((entry) => entry.characterId === parsed.data.characterId && entry.chapterId === chapterId);
     beginSse(response);
     writeSse(response, "phase", { stage: "writing" } satisfies StreamPhase);
     if (cached) {
       writeSse(response, "phase", { stage: "validating" } satisfies StreamPhase);
-      return streamComplete(response, { story: existing, perspective: cached });
+      return streamComplete(response, { story: snapshot.story, perspective: cached });
     }
-    const perspective = await generatePerspectiveStream(world, existing, parsed.data.characterId, storyStreamCallbacks(response));
+    const perspective = await generatePerspectiveStream(world, snapshot.story, parsed.data.characterId, storyStreamCallbacks(response));
     if (!perspective) return streamError(response, "The character perspective could not be generated");
     try {
-      const updated: WorldStory = { ...existing, perspectives: [...existing.perspectives.filter((entry) => entry.chapterId !== chapterId || entry.characterId !== parsed.data.characterId), perspective] };
-      const story = store.saveWorldStory(updated);
-      streamComplete(response, { story, perspective });
+      const updated: WorldStory = { ...snapshot.story, perspectives: [...snapshot.story.perspectives.filter((entry) => entry.chapterId !== chapterId || entry.characterId !== parsed.data.characterId), perspective] };
+      const story = await saveSnapshot(store, updated, snapshot);
+      if (!story) return streamError(response, "The story changed while this perspective was being generated. Reload and try again.");
+      return streamComplete(response, { story, perspective });
     } catch {
-      streamError(response, "The character perspective could not be saved");
+      return streamError(response, "The character perspective could not be saved");
     }
   });
+
   return router;
 }

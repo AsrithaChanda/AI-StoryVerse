@@ -30,6 +30,8 @@ export type WorldStory = {
   updatedAt: string;
   /** Optional in types while old stored stories are upgraded on read. */
   upcomingDirections?: string[];
+  /** Incremented by PostgreSQL-backed persistence to reject stale concurrent writes. */
+  version?: number;
 };
 
 export type NextChapterGeneration = { chapter: StoryChapter; newCharacters: StoryCharacter[] };

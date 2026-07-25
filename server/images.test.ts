@@ -5,12 +5,13 @@ import { DatabaseSync } from "node:sqlite";
 import { afterEach, describe, expect, it } from "vitest";
 import { createImageRouter } from "./image-routes.js";
 import { WorldStore, type World } from "./worlds.js";
-import { LocalImageAssetStore } from "./images/assets.js";
+import { LocalImageAssetStore, StoryImageAssetStore } from "./images/assets.js";
 import { StoryImagePipeline } from "./images/pipeline.js";
 import { buildImagePrompt, imageCacheKey } from "./images/prompts.js";
 import { DisabledImageGenerator, MockImageGenerator } from "./images/provider.js";
 import { ImageGenerationError, type GeneratedImage, type ImageGenerationInput, type ImageGenerator, type ImageRequest } from "./images/types.js";
 import type { WorldStory } from "./story.js";
+import type { AssetStore, StoredAsset } from "./storage/index.js";
 
 const temporaryDirectories: string[] = [];
 
@@ -221,6 +222,25 @@ describe("story image prompt contracts", () => {
 });
 
 describe("story image pipeline resilience and cache", () => {
+  it("stores generated image bytes through the injected object-store contract", async () => {
+    const objects = new Map<string, StoredAsset>();
+    const objectStore: AssetStore = {
+      put: async (key, bytes, contentType) => { objects.set(key, { bytes, contentType }); },
+      exists: async (key) => objects.has(key),
+      read: async (key) => objects.get(key) ?? null,
+    };
+    const store = new WorldStore(new DatabaseSync(":memory:"));
+    const world = createTestWorld(store);
+    saveTestStory(store, world.id);
+    const pipeline = new StoryImagePipeline(store, new MockImageGenerator(), new StoryImageAssetStore(objectStore));
+
+    const image = await pipeline.generate(chapterRequest(world.id));
+
+    expect(image.status).toBe("ready");
+    expect([...objects.keys()]).toEqual([`images/${image.cacheKey}.svg`]);
+    expect(objects.get(`images/${image.cacheKey}.svg`)?.contentType).toBe("image/svg+xml");
+  });
+
   it("persists a ready mock image once and reuses it for repeat and concurrent requests", async () => {
     const { pipeline, generator, store, world } = await fixture();
     const request = chapterRequest(world.id);
@@ -262,7 +282,7 @@ describe("story image pipeline resilience and cache", () => {
     expect(store.findStoryImage(world.id, request.sceneId, request.branchId, request.protagonistId)).not.toBeNull();
     // A reader requests only the current prompt contract, never an arbitrary
     // previous image record with the same scene identity.
-    expect(pipeline.get(request)).toBeNull();
+    await expect(pipeline.get(request)).resolves.toBeNull();
   });
 
   it("returns a polished fallback when no provider key is configured", async () => {

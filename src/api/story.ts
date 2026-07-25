@@ -4,7 +4,7 @@ export type StoryAudioDirection = { primaryEmotion: "reflection" | "suspense" | 
 export type StoryChapter = { id: string; number: number; title: string; narration: string; beats: StoryBeat[]; audioDirection?: StoryAudioDirection; command?: string; revision?: number };
 export type Perspective = { characterId: string; chapterId: string; narration: string; beats: StoryBeat[] };
 /** Optional while existing persisted stories are upgraded by the server. */
-export type WorldStory = { worldId: string; characters: StoryCharacter[]; chapters: StoryChapter[]; perspectives: Perspective[]; worldState: string; source: "openai" | "fallback"; createdAt: string; updatedAt: string; upcomingDirections?: string[] };
+export type WorldStory = { worldId: string; characters: StoryCharacter[]; chapters: StoryChapter[]; perspectives: Perspective[]; worldState: string; source: "openai" | "fallback"; createdAt: string; updatedAt: string; upcomingDirections?: string[]; /** Present for PostgreSQL-backed concurrent writes. */ version?: number };
 export type ChapterRollbackResult = { story: WorldStory; chapter: StoryChapter };
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {

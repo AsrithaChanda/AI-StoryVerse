@@ -1,9 +1,8 @@
 import { createHash } from "node:crypto";
-import { existsSync } from "node:fs";
-import { mkdir, writeFile } from "node:fs/promises";
 import { resolve } from "node:path";
+import type { StoryStore } from "./persistence/store.js";
+import { LocalAssetStore, type AssetStore, type StoredAsset } from "./storage/index.js";
 import type { StoryCharacter } from "./story.js";
-import type { WorldStore } from "./worlds.js";
 
 export type NarratorProfile = { genderPresentation: "feminine" | "masculine" | "neutral"; ageTone: "young adult" | "mature" | "elder"; voice: "coral" | "onyx" | "sage"; delivery: string };
 export type ChapterAudioPlan = { worldId: string; chapterId: string; protagonistId?: string; mood: string; bgm: { id: string; title: string; url: string }; narrator: NarratorProfile; narrationSource: { kind: "canonical" | "character"; label: string }; narrationText: string; narrationExcerpt: string; contentHash: string };
@@ -56,19 +55,32 @@ function narratorFor(genre: string, mood: string, character?: StoryCharacter): N
   return { genderPresentation: "neutral", ageTone: "mature", voice: "sage", delivery: mood === "danger" ? "quietly tense" : "calm and observant" };
 }
 
-/** The chapter-audio agent makes the two coupled decisions: local music cue
- * and narration persona. It never asks a model to compose music. */
+/**
+ * The chapter-audio director selects a BGM cue and a narrator persona from
+ * saved chapter content. It writes narration bytes to the injected asset
+ * store, so local files and Databricks Volumes share the same API surface.
+ */
 export class ChapterAudioDirector {
-  public constructor(private readonly store: WorldStore, private readonly assetDirectory = resolve(process.cwd(), "data", "story-narrations")) {}
-  public plan(worldId: string, chapterId: string, protagonistId?: string): ChapterAudioPlan | null {
-    const world = this.store.get(worldId); const story = this.store.getWorldStory(worldId); const chapter = story?.chapters.find((entry) => entry.id === chapterId);
+  private readonly assets: AssetStore;
+
+  public constructor(
+    private readonly store: StoryStore,
+    assetsOrDirectory: AssetStore | string = resolve(process.cwd(), "data", "story-narrations"),
+    private readonly prefix = "",
+  ) {
+    this.assets = typeof assetsOrDirectory === "string" ? new LocalAssetStore(assetsOrDirectory) : assetsOrDirectory;
+  }
+
+  public async plan(worldId: string, chapterId: string, protagonistId?: string): Promise<ChapterAudioPlan | null> {
+    const [world, story] = await Promise.all([this.store.get(worldId), this.store.getWorldStory(worldId)]);
+    const chapter = story?.chapters.find((entry) => entry.id === chapterId);
     if (!world || !story || !chapter) return null;
     const pov = protagonistId ? story.perspectives.find((entry) => entry.characterId === protagonistId && entry.chapterId === chapterId) : undefined;
     if (protagonistId && !pov) return null;
     const narrationText = pov?.narration ?? chapter.narration;
     const fallbackMood = moodOf(`${chapter.title}\n${narrationText}`);
     const direction = chapter.audioDirection;
-    const mood = direction?.bgmCue ?? fallbackMood;
+    const mood = direction?.bgmCue && library[direction.bgmCue] ? direction.bgmCue : fallbackMood;
     const selectedCharacter = protagonistId ? story.characters.find((entry) => entry.id === protagonistId) : undefined;
     if (protagonistId && !selectedCharacter) return null;
     const baseNarrator = narratorFor(world.genre, mood, selectedCharacter);
@@ -78,16 +90,17 @@ export class ChapterAudioDirector {
     } : baseNarrator;
     const narrationSource = selectedCharacter ? { kind: "character" as const, label: `${selectedCharacter.name}'s perspective` } : { kind: "canonical" as const, label: "Canonical narrator perspective" };
     const contentHash = createHash("sha256").update(narrationText).digest("hex").slice(0, 16);
-    return { worldId, chapterId, protagonistId, mood, bgm: library[mood], narrator, narrationSource, narrationText, narrationExcerpt: narrationText.replace(/\s+/g, " ").trim().slice(0, 180), contentHash };
+    return { worldId, chapterId, protagonistId, mood, bgm: library[mood] ?? library.reflection, narrator, narrationSource, narrationText, narrationExcerpt: narrationText.replace(/\s+/g, " ").trim().slice(0, 180), contentHash };
   }
+
   public async narrate(plan: ChapterAudioPlan): Promise<{ status: "ready" | "fallback"; audioUrl?: string; narrator: NarratorProfile; bgm: Bgm; narrationSource: ChapterAudioPlan["narrationSource"]; contentHash: string; errorCode?: string }> {
-    // Do not reuse legacy generative-audio files: this renderer reads the saved
-    // text directly, and its version/model are part of the cache identity.
+    // The renderer reads the saved text directly. Model and persona are part
+    // of the cache identity, so changing perspective cannot replay old prose.
     const narrationModel = process.env.OPENAI_NARRATION_MODEL || "gpt-4o-mini-tts";
     const key = createHash("sha256").update(JSON.stringify({ renderer: "openai-tts-v1", narrationModel, worldId: plan.worldId, chapterId: plan.chapterId, protagonistId: plan.protagonistId ?? null, contentHash: plan.contentHash, narrator: plan.narrator })).digest("hex").slice(0, 40);
-    const filename = `${key}.wav`; const output = resolve(this.assetDirectory, filename);
-    if (existsSync(output)) return { status: "ready", audioUrl: `/api/narrations/assets/${filename}`, narrator: plan.narrator, bgm: plan.bgm, narrationSource: plan.narrationSource, contentHash: plan.contentHash };
-    if (!process.env.OPENAI_API_KEY) return { status: "fallback", narrator: plan.narrator, bgm: plan.bgm, narrationSource: plan.narrationSource, contentHash: plan.contentHash, errorCode: "provider_disabled" };
+    const filename = `${key}.wav`;
+    if (await this.assets.exists(this.assetKey(filename))) return this.ready(plan, filename);
+    if (!process.env.OPENAI_API_KEY) return this.fallback(plan, "provider_disabled");
     try {
       const response = await fetch("https://api.openai.com/v1/audio/speech", {
         method: "POST",
@@ -101,12 +114,30 @@ export class ChapterAudioDirector {
           response_format: "wav",
         }),
       });
-      if (!response.ok) return { status: "fallback", narrator: plan.narrator, bgm: plan.bgm, narrationSource: plan.narrationSource, contentHash: plan.contentHash, errorCode: "provider_error" };
-      const bytes = Buffer.from(await response.arrayBuffer());
-      if (bytes.length < 44 || bytes.length > 40 * 1024 * 1024) return { status: "fallback", narrator: plan.narrator, bgm: plan.bgm, narrationSource: plan.narrationSource, contentHash: plan.contentHash, errorCode: "invalid_response" };
-      await mkdir(this.assetDirectory, { recursive: true }); await writeFile(output, bytes, { flag: "w" });
-      return { status: "ready", audioUrl: `/api/narrations/assets/${filename}`, narrator: plan.narrator, bgm: plan.bgm, narrationSource: plan.narrationSource, contentHash: plan.contentHash };
-    } catch { return { status: "fallback", narrator: plan.narrator, bgm: plan.bgm, narrationSource: plan.narrationSource, contentHash: plan.contentHash, errorCode: "provider_error" }; }
+      if (!response.ok) return this.fallback(plan, "provider_error");
+      const bytes = new Uint8Array(await response.arrayBuffer());
+      if (bytes.length < 44 || bytes.length > 40 * 1024 * 1024) return this.fallback(plan, "invalid_response");
+      await this.assets.put(this.assetKey(filename), bytes, "audio/wav");
+      return this.ready(plan, filename);
+    } catch {
+      return this.fallback(plan, "provider_error");
+    }
   }
-  public assetPath(filename: string): string | null { return /^[a-f0-9]{40}\.wav$/i.test(filename) ? resolve(this.assetDirectory, filename) : null; }
+
+  public async getAsset(filename: string): Promise<StoredAsset | null> {
+    if (!/^[a-f0-9]{40}\.wav$/i.test(filename)) return null;
+    return this.assets.read(this.assetKey(filename));
+  }
+
+  private assetKey(filename: string): string {
+    return this.prefix ? `${this.prefix}/${filename}` : filename;
+  }
+
+  private ready(plan: ChapterAudioPlan, filename: string) {
+    return { status: "ready" as const, audioUrl: `/api/narrations/assets/${filename}`, narrator: plan.narrator, bgm: plan.bgm, narrationSource: plan.narrationSource, contentHash: plan.contentHash };
+  }
+
+  private fallback(plan: ChapterAudioPlan, errorCode: string) {
+    return { status: "fallback" as const, narrator: plan.narrator, bgm: plan.bgm, narrationSource: plan.narrationSource, contentHash: plan.contentHash, errorCode };
+  }
 }

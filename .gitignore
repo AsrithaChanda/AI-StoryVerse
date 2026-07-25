@@ -6,3 +6,5 @@ coverage
 data/*.db
 data/story-images/
 data/story-audio/
+data/story-assets/
+data/story-narrations/

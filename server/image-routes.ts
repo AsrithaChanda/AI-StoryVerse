@@ -1,8 +1,7 @@
-import { existsSync } from "node:fs";
 import { Router, type Request, type Response } from "express";
 import { z } from "zod";
-import type { WorldStore } from "./worlds.js";
-import { LocalImageAssetStore } from "./images/assets.js";
+import type { StoryStore } from "./persistence/store.js";
+import { LocalImageAssetStore, StoryImageAssetStore } from "./images/assets.js";
 import { createStoryImagePipeline, StoryImagePipeline } from "./images/pipeline.js";
 import { ImageGenerationError, type ImageGenerator, type ImageRequest } from "./images/types.js";
 
@@ -18,9 +17,9 @@ const imageRequestSchema = z.object({
 }).strict();
 
 export type ImageRouterOptions = {
-  store: WorldStore;
+  store: StoryStore;
   generator?: ImageGenerator;
-  assets?: LocalImageAssetStore;
+  assets?: StoryImageAssetStore;
   pipeline?: StoryImagePipeline;
 };
 
@@ -34,16 +33,20 @@ export function createImageRouter(options: ImageRouterOptions): Router {
   const assets = options.assets ?? new LocalImageAssetStore();
   const pipeline = options.pipeline ?? createStoryImagePipeline(options.store, { generator: options.generator, assets });
 
-  router.get("/images/assets/:filename", (request: Request, response: Response) => {
-    const path = typeof request.params.filename === "string" ? assets.pathFor(request.params.filename) : null;
-    if (!path || !existsSync(path)) return response.status(404).json({ error: "Image asset not found" });
-    return response.sendFile(path);
+  router.get("/images/assets/:filename", async (request: Request, response: Response) => {
+    try {
+      const asset = typeof request.params.filename === "string" ? await assets.read(request.params.filename) : null;
+      if (!asset) return response.status(404).json({ error: "Image asset not found" });
+      return response.type(asset.contentType).send(Buffer.from(asset.bytes));
+    } catch {
+      return response.status(500).json({ error: "Unable to read image asset" });
+    }
   });
 
-  router.get("/images/cache/:cacheKey", (request: Request, response: Response) => {
+  router.get("/images/cache/:cacheKey", async (request: Request, response: Response) => {
     const parsed = z.string().regex(/^[a-f0-9]{40}$/i).safeParse(request.params.cacheKey);
     if (!parsed.success) return response.status(400).json({ error: "Invalid image cache key" });
-    const image = options.store.getStoryImageByCacheKey(parsed.data);
+    const image = await options.store.getStoryImageByCacheKey(parsed.data);
     return image ? response.json({ image: {
       id: image.id, cacheKey: image.cacheKey, worldId: image.worldId, branchId: image.branchId,
       sceneId: image.sceneId, protagonistId: image.protagonistId, characterIds: image.characterIds,
@@ -53,13 +56,13 @@ export function createImageRouter(options: ImageRouterOptions): Router {
     } }) : response.status(404).json({ error: "Image not found" });
   });
 
-  router.get("/images/:sceneId", (request: Request, response: Response) => {
+  router.get("/images/:sceneId", async (request: Request, response: Response) => {
     const parsed = z.object({
       sceneId: idSchema, worldId: idSchema,
       branchId: idSchema.optional(), protagonistId: idSchema.optional(),
     }).safeParse({ sceneId: request.params.sceneId, worldId: request.query.worldId, branchId: request.query.branchId, protagonistId: request.query.protagonistId });
     if (!parsed.success) return response.status(400).json({ error: "worldId and sceneId are required identifiers" });
-    const image = pipeline.get(parsed.data);
+    const image = await pipeline.get(parsed.data);
     return image ? response.json({ image }) : response.status(404).json({ error: "Image not found" });
   });
 
@@ -72,7 +75,7 @@ export function createImageRouter(options: ImageRouterOptions): Router {
   router.post("/worlds/:worldId/cover", async (request: Request, response: Response) => {
     const worldId = idSchema.safeParse(request.params.worldId);
     if (!worldId.success) return response.status(400).json({ error: "Invalid world identifier" });
-    if (!options.store.get(worldId.data)) return response.status(404).json({ error: "World not found" });
+    if (!await options.store.get(worldId.data)) return response.status(404).json({ error: "World not found" });
     // Body accepts one constrained Boolean only; it never accepts prompt text.
     const body = z.object({ retry: z.boolean().optional() }).strict().safeParse(request.body ?? {});
     if (!body.success) return response.status(400).json({ error: "Invalid cover generation request" });

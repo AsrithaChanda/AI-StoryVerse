@@ -1,0 +1,62 @@
+name: storyverse
+
+services:
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: storyverse:local
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      NODE_ENV: production
+      PORT: "8787"
+      # The application prefers DATABASE_URL over individual PG* settings.
+      DATABASE_URL: postgresql://storyverse:storyverse@postgres:5432/storyverse
+      STORYVERSE_PG_POOL_MAX: ${STORYVERSE_PG_POOL_MAX:-10}
+      STORYVERSE_PG_IDLE_TIMEOUT_MS: ${STORYVERSE_PG_IDLE_TIMEOUT_MS:-30000}
+      STORYVERSE_PG_CONNECT_TIMEOUT_MS: ${STORYVERSE_PG_CONNECT_TIMEOUT_MS:-10000}
+      STORYVERSE_ASSET_STORAGE: local
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      OPENAI_MODEL: ${OPENAI_MODEL:-gpt-5.6-luna}
+      OPENAI_IMAGE_MODEL: ${OPENAI_IMAGE_MODEL:-gpt-image-2}
+      OPENAI_NARRATION_MODEL: ${OPENAI_NARRATION_MODEL:-gpt-4o-mini-tts}
+      OPENAI_AUDIO_MODEL: ${OPENAI_AUDIO_MODEL:-gpt-audio}
+      STORYVERSE_IMAGE_PROVIDER: ${STORYVERSE_IMAGE_PROVIDER:-}
+      STORYVERSE_IMAGE_TIMEOUT_MS: ${STORYVERSE_IMAGE_TIMEOUT_MS:-180000}
+      STORYVERSE_IMAGE_SIZE: ${STORYVERSE_IMAGE_SIZE:-1024x1024}
+      STORYVERSE_IMAGE_QUALITY: ${STORYVERSE_IMAGE_QUALITY:-medium}
+      STORYVERSE_NARRATION_TIMEOUT_MS: ${STORYVERSE_NARRATION_TIMEOUT_MS:-120000}
+    ports:
+      - "8787:8787"
+    volumes:
+      # Persist local image/narration fallbacks across container recreation.
+      - storyverse_data:/app/data
+    healthcheck:
+      test: ["CMD-SHELL", "node -e \"fetch('http://127.0.0.1:8787/api/health').then((response) => process.exit(response.ok ? 0 : 1)).catch(() => process.exit(1))\""]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 20s
+
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: storyverse
+      POSTGRES_USER: storyverse
+      # Development-only credential. Never use this value in production.
+      POSTGRES_PASSWORD: storyverse
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U storyverse -d storyverse"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+
+volumes:
+  postgres_data:
+  storyverse_data:
