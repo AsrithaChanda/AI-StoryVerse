@@ -1,0 +1,8 @@
+node_modules
+dist
+.env
+*.tsbuildinfo
+coverage
+data/*.db
+data/story-images/
+data/story-audio/
