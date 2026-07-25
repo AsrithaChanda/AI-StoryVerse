@@ -79,7 +79,7 @@ export default function ChapterTimelineActions({
   const copy = visibleConfirmation ? confirmationCopy(visibleConfirmation, selectedChapterNumber) : null;
 
   return <section className="chapter-timeline-actions" aria-label="Chapter deletion actions">
-    <div className="chapter-timeline-actions__copy"><p>CHAPTER MAINTENANCE</p><small>Delete only the part of the timeline you no longer want to keep.</small></div>
+    <span className="chapter-timeline-actions__label" aria-hidden="true">TIMELINE</span>
     <div className="chapter-timeline-actions__buttons">
       {canDeleteCurrent && <button ref={currentTrigger} type="button" className="chapter-timeline-actions__button" disabled={busy} onClick={() => setConfirmation("current")}>Delete this chapter</button>}
       {canDeleteFuture && <button ref={futureTrigger} type="button" className="chapter-timeline-actions__button" disabled={busy} onClick={() => setConfirmation("future")}>Delete future chapters</button>}

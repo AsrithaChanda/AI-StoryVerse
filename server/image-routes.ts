@@ -37,7 +37,10 @@ export function createImageRouter(options: ImageRouterOptions): Router {
     try {
       const asset = typeof request.params.filename === "string" ? await assets.read(request.params.filename) : null;
       if (!asset) return response.status(404).json({ error: "Image asset not found" });
-      return response.type(asset.contentType).send(Buffer.from(asset.bytes));
+      // Image URLs are content-addressed by the immutable cache key. Let the
+      // browser reuse a previously fetched local/Volume asset immediately;
+      // the server remains the only holder of Databricks credentials.
+      return response.set("Cache-Control", "public, max-age=31536000, immutable").type(asset.contentType).send(Buffer.from(asset.bytes));
     } catch {
       return response.status(500).json({ error: "Unable to read image asset" });
     }

@@ -13,9 +13,9 @@ No prewritten or seeded story universe is included. The archive starts empty and
 - Remove the current chapter only when it is the latest chapter and a prior chapter exists; the reader returns to that prior chapter.
 - While viewing any earlier chapter, prune every later chapter in one confirmed action. The rollback removes deleted chapters' POVs, chapter-introduced cast members, and database image-cache records so a new future starts cleanly.
 - Queue multiple upcoming directions, including any number of character introductions. The queue is saved with the world, injected into the next chapter's model context, and cleared only after that chapter is successfully persisted. New characters returned by the structured generation are added to the persistent cast for later chapters and POVs.
-- Continue the story chapter by chapter with live draft prose streaming into a clear generation stage before the canonical chapter is saved.
+- Continue the story chapter by chapter with live draft prose streaming into a clear generation stage. A completed canonical chapter opens only after its complete visual sequence is restored from cache or resolved to ready/fallback frames.
 - Browse the whole persistent cast in a searchable directory, then switch the current chapter to any selected character’s point of view with the same progressive loading treatment.
-- Generate and cache cinematic illustrations for chapter beats and character perspectives.
+- Generate and cache cinematic illustrations for chapter beats and character perspectives. Content-addressed image URLs are served through the same API from local development storage or a private Databricks Volume in production, then browser-cached for immediate revisits.
 - Listen to the displayed canonical or character-perspective prose with selected narration speed and restart controls.
 - Hear a scene-appropriate local BGM track selected by the chapter-audio director.
 
