@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { DatabaseSync } from "node:sqlite";
 import type { NewStoryImage, StoredStoryImage } from "./images/types.js";
-import { MAX_UPCOMING_DIRECTIONS, type WorldStory } from "./story.js";
+import { MAX_UPCOMING_DIRECTIONS, type StoryChapter, type WorldStory } from "./story.js";
 
 export type World = {
   id: string;
@@ -18,6 +18,16 @@ export type World = {
 export type CreateWorldInput = Pick<World, "title" | "premise" | "genre" | "creatorPrompt">;
 
 type WorldRow = Omit<World, "characters" | "source"> & { characters_json: string; source: World["source"] };
+
+export type StoryChapterDeletion = {
+  story: WorldStory;
+  /** The surviving canonical chapter: prior for a latest deletion, selected for a future trim. */
+  chapter: StoryChapter;
+  removedChapterIds: string[];
+};
+
+export type StoryChapterDeletionFailure = "story_not_found" | "chapter_not_found" | "chapter_is_not_latest" | "chapter_has_no_previous";
+export type StoryChapterDeletionResult = { ok: true; value: StoryChapterDeletion } | { ok: false; reason: StoryChapterDeletionFailure };
 
 /**
  * The former demo universe was seeded under this ID. Keep only the stable ID
@@ -178,6 +188,71 @@ export class WorldStore {
     return persisted;
   }
 
+  /**
+   * Remove one canonical chapter only when it is the current latest chapter
+   * and a prior chapter remains. Story JSON, POV records, and all cached art
+   * in the deleted chapter's scene namespace change together in one SQLite
+   * transaction.
+   */
+  public deleteLatestChapter(worldId: string, chapterId: string): StoryChapterDeletionResult {
+    return this.inTransaction(() => {
+      const story = this.getWorldStory(worldId);
+      if (!story) return { ok: false, reason: "story_not_found" };
+      const index = story.chapters.findIndex((chapter) => chapter.id === chapterId);
+      if (index < 0) return { ok: false, reason: "chapter_not_found" };
+      if (index !== story.chapters.length - 1) return { ok: false, reason: "chapter_is_not_latest" };
+      if (index === 0) return { ok: false, reason: "chapter_has_no_previous" };
+      return { ok: true, value: this.deleteStoryChapters(story, story.chapters.slice(index)) };
+    });
+  }
+
+  /**
+   * Retain the selected chapter and remove every later chapter. This is
+   * intentionally idempotent for the current latest chapter.
+   */
+  public deleteFutureChapters(worldId: string, chapterId: string): StoryChapterDeletionResult {
+    return this.inTransaction(() => {
+      const story = this.getWorldStory(worldId);
+      if (!story) return { ok: false, reason: "story_not_found" };
+      const index = story.chapters.findIndex((chapter) => chapter.id === chapterId);
+      if (index < 0) return { ok: false, reason: "chapter_not_found" };
+      const chapter = story.chapters[index]!;
+      const removed = story.chapters.slice(index + 1);
+      if (removed.length === 0) return { ok: true, value: { story, chapter, removedChapterIds: [] } };
+      return { ok: true, value: this.deleteStoryChapters(story, removed) };
+    });
+  }
+
+  /** Call only inside an open transaction after the target chapters are validated. */
+  private deleteStoryChapters(story: WorldStory, removed: StoryChapter[]): StoryChapterDeletion {
+    const removedChapterIds = removed.map((chapter) => chapter.id);
+    const removedIds = new Set(removedChapterIds);
+    const retainedChapters = story.chapters.filter((chapter) => !removedIds.has(chapter.id));
+    const updated: WorldStory = {
+      ...story,
+      chapters: retainedChapters,
+      perspectives: story.perspectives.filter((perspective) => !removedIds.has(perspective.chapterId)),
+      // Missing origins are migrated to chapter 1 before this point, but the
+      // fallback keeps an old in-memory record safe if callers bypass reload.
+      characters: story.characters.filter((character) => !removedIds.has(character.introducedInChapter ?? "chapter-1")),
+    };
+    this.deleteStoryImagesForChapters(story.worldId, removedChapterIds);
+    const persisted = this.saveWorldStory(updated);
+    const chapter = persisted.chapters.at(-1);
+    if (!chapter) throw new Error("Chapter deletion removed every chapter");
+    return { story: persisted, chapter, removedChapterIds };
+  }
+
+  /**
+   * Scene IDs use a chapter-owned prefix for canonical, POV, and revision
+   * variants. Clearing the whole namespace prevents a regenerated chapter
+   * with the same ID from finding stale art from an earlier timeline.
+   */
+  private deleteStoryImagesForChapters(worldId: string, chapterIds: string[]): void {
+    const statement = this.db.prepare("DELETE FROM story_images WHERE world_id = ? AND (scene_id = ? OR scene_id LIKE ?)");
+    for (const chapterId of chapterIds) statement.run(worldId, chapterId, `${chapterId}-%`);
+  }
+
   public visualBeat(worldId: string, sceneId: string): string | null {
     const story = this.getWorldStory(worldId);
     if (!story) return null;
@@ -317,6 +392,17 @@ function migrateLegacyChapterSceneIds(story: WorldStory): WorldStory {
     if (chapter.id !== id || chapter.revision !== revision) { changed = true; chapterChanged = true; }
     return chapterChanged ? { ...chapter, id, revision, beats } : chapter;
   });
+  const canonicalChapterIds = new Set(chapters.map((chapter) => chapter.id));
+  const characters = story.characters.map((character) => {
+    const suppliedOrigin = typeof character.introducedInChapter === "string" ? character.introducedInChapter : undefined;
+    const mappedOrigin = suppliedOrigin ? (chapterIdMap.get(suppliedOrigin) ?? suppliedOrigin) : undefined;
+    // Older persisted stories did not track origins. Treat their cast as
+    // Chapter 1 characters so truncating a later chapter cannot erase them.
+    const introducedInChapter = mappedOrigin && canonicalChapterIds.has(mappedOrigin) ? mappedOrigin : "chapter-1";
+    if (character.introducedInChapter === introducedInChapter) return character;
+    changed = true;
+    return { ...character, introducedInChapter };
+  });
   const perspectives = story.perspectives.map((perspective) => {
     const chapterId = chapterIdMap.get(perspective.chapterId) ?? perspective.chapterId;
     const revision = chapterRevisionMap.get(chapterId) ?? 1;
@@ -333,7 +419,7 @@ function migrateLegacyChapterSceneIds(story: WorldStory): WorldStory {
   });
   const upcomingDirections = normalizeUpcomingDirections(story.upcomingDirections);
   if (!sameStringArray(story.upcomingDirections, upcomingDirections)) changed = true;
-  return changed ? { ...story, chapters, perspectives, worldState, upcomingDirections } : story;
+  return changed ? { ...story, characters, chapters, perspectives, worldState, upcomingDirections } : story;
 }
 
 function normalizeUpcomingDirections(value: unknown): string[] {

@@ -1,7 +1,7 @@
 import { Router, type Request, type Response } from "express";
 import { z } from "zod";
 import { generateInitialStory, generateNextChapter, generateNextChapterStream, generatePerspective, generatePerspectiveStream, MAX_UPCOMING_DIRECTIONS, reviseLatestChapter, reviseLatestChapterStream, type ChapterRevisionGeneration, type NextChapterGeneration, type StoryStreamCallbacks, type WorldStory } from "./story.js";
-import type { WorldStore } from "./worlds.js";
+import type { StoryChapterDeletionFailure, WorldStore } from "./worlds.js";
 
 const id = z.string().trim().min(1).max(64).regex(/^[a-z0-9_-]+$/i);
 const commandSchema = z.object({ command: z.string().trim().min(3).max(1000) }).strict();
@@ -41,6 +41,15 @@ function streamComplete(response: Response, payload: unknown): void {
   response.end();
 }
 
+function chapterDeletionError(response: Response, reason: StoryChapterDeletionFailure): Response {
+  switch (reason) {
+    case "story_not_found": return response.status(409).json({ error: "Generate Chapter 1 first" });
+    case "chapter_not_found": return response.status(404).json({ error: "Chapter not found" });
+    case "chapter_is_not_latest": return response.status(409).json({ error: "Only the latest chapter can be deleted individually" });
+    case "chapter_has_no_previous": return response.status(409).json({ error: "Chapter 1 cannot be deleted" });
+  }
+}
+
 function appendGeneratedChapter(existing: WorldStory, generated: NextChapterGeneration): WorldStory {
   return {
     ...existing,
@@ -73,6 +82,28 @@ export function createStoryRouter(store: WorldStore): Router {
     if (!worldId.success) return response.status(400).json({ error: "Invalid world identifier" });
     const story = store.getWorldStory(worldId.data);
     return story ? response.json({ story }) : response.status(404).json({ error: "Story has not been generated" });
+  });
+  // Retain `chapterId` and remove every later chapter. The response always
+  // names the surviving canonical chapter that the reader should display.
+  router.delete("/worlds/:worldId/story/chapters/:chapterId/future", (request, response) => {
+    const worldId = id.safeParse(request.params.worldId);
+    const chapterId = id.safeParse(request.params.chapterId);
+    if (!worldId.success || !chapterId.success) return response.status(400).json({ error: "Invalid world or chapter identifier" });
+    if (!store.get(worldId.data)) return response.status(404).json({ error: "World not found" });
+    const result = store.deleteFutureChapters(worldId.data, chapterId.data);
+    if (!result.ok) return chapterDeletionError(response, result.reason);
+    return response.json({ story: result.value.story, chapter: result.value.chapter });
+  });
+  // A single-chapter delete is deliberately constrained to the current end of
+  // the timeline, and Chapter 1 remains the immutable starting point.
+  router.delete("/worlds/:worldId/story/chapters/:chapterId", (request, response) => {
+    const worldId = id.safeParse(request.params.worldId);
+    const chapterId = id.safeParse(request.params.chapterId);
+    if (!worldId.success || !chapterId.success) return response.status(400).json({ error: "Invalid world or chapter identifier" });
+    if (!store.get(worldId.data)) return response.status(404).json({ error: "World not found" });
+    const result = store.deleteLatestChapter(worldId.data, chapterId.data);
+    if (!result.ok) return chapterDeletionError(response, result.reason);
+    return response.json({ story: result.value.story, chapter: result.value.chapter });
   });
   router.post("/worlds/:worldId/story/bootstrap", async (request, response) => {
     const world = store.get(request.params.worldId);

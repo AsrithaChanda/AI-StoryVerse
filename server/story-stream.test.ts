@@ -70,11 +70,19 @@ function modelJsonResponse(payload: unknown, status = 200): Response {
 type RouteHandler = { handle: (request: unknown, response: unknown, next: () => void) => unknown };
 type RouteLayer = { route?: { path: string; methods: Record<string, boolean>; stack: RouteHandler[] } };
 
-function postRoute(store: WorldStore, path: string): RouteHandler {
+function routeHandler(store: WorldStore, path: string, method: "post" | "delete"): RouteHandler {
   const router = createStoryRouter(store) as unknown as { stack: RouteLayer[] };
-  const route = router.stack.find((layer) => layer.route?.path === path && layer.route.methods.post)?.route;
-  if (!route) throw new Error(`Route not found: ${path}`);
+  const route = router.stack.find((layer) => layer.route?.path === path && layer.route.methods[method])?.route;
+  if (!route) throw new Error(`Route not found: ${method} ${path}`);
   return route.stack[0]!;
+}
+
+function postRoute(store: WorldStore, path: string): RouteHandler {
+  return routeHandler(store, path, "post");
+}
+
+function deleteRoute(store: WorldStore, path: string): RouteHandler {
+  return routeHandler(store, path, "delete");
 }
 
 function streamRecorder(): { response: ExpressResponse; events: () => Array<{ event: string; payload: unknown }>; ended: () => boolean } {
@@ -110,6 +118,57 @@ function jsonRecorder(): { response: ExpressResponse; status: () => number; payl
     end: () => undefined,
   };
   return { response: response as unknown as ExpressResponse, status: () => statusCode, payload: () => responsePayload };
+}
+
+function rollbackCharacter(id: string, introducedInChapter: string) {
+  return {
+    id,
+    name: `Rollback ${id}`,
+    role: "Test role",
+    visualDescription: "A distinct rollback test visual.",
+    personality: "Careful",
+    goal: "Preserve the rollback contract.",
+    memories: ["The rollback test began."],
+    introducedInChapter,
+  } as WorldStory["characters"][number];
+}
+
+function rollbackStory(worldId: string): WorldStory {
+  const chapter = (number: number): StoryChapter => ({
+    id: `chapter-${number}`,
+    number,
+    revision: 1,
+    title: `Rollback Chapter ${number}`,
+    narration: `Rollback chapter ${number} preserves a distinct test continuity state.`,
+    beats: [{ id: `chapter-${number}-beat-1`, description: `Rollback chapter ${number} visual beat.`, caption: `Rollback ${number}` }],
+  });
+  return {
+    worldId,
+    characters: [rollbackCharacter("base-character", "chapter-1"), rollbackCharacter("chapter-two-character", "chapter-2"), rollbackCharacter("chapter-three-character", "chapter-3")],
+    chapters: [chapter(1), chapter(2), chapter(3)],
+    perspectives: [
+      { characterId: "base-character", chapterId: "chapter-1", narration: "Chapter one view.", beats: [{ id: "chapter-1-base-character-beat-1", description: "Chapter one perspective.", caption: "One" }] },
+      { characterId: "chapter-two-character", chapterId: "chapter-2", narration: "Chapter two view.", beats: [{ id: "chapter-2-chapter-two-character-beat-1", description: "Chapter two perspective.", caption: "Two" }] },
+      { characterId: "chapter-three-character", chapterId: "chapter-3", narration: "Chapter three view.", beats: [{ id: "chapter-3-chapter-three-character-beat-1", description: "Chapter three perspective.", caption: "Three" }] },
+    ],
+    upcomingDirections: ["Keep this queued direction after rollback."],
+    worldState: "The rollback test world preserves earlier canonical history.",
+    source: "openai",
+    createdAt: "2026-01-01T00:00:00.000Z",
+    updatedAt: "2026-01-01T00:00:00.000Z",
+  };
+}
+
+function reserveRollbackImage(store: WorldStore, worldId: string, sceneId: string): void {
+  store.reserveStoryImage({
+    cacheKey: `rollback-${worldId}-${sceneId}`,
+    worldId,
+    sceneId,
+    characterIds: [],
+    promptVersion: "rollback-test",
+    prompt: "A rollback test image.",
+    fallbackUrl: "data:image/svg+xml;base64,",
+  });
 }
 
 describe("progressive story generation", () => {
@@ -331,14 +390,108 @@ describe("progressive story generation", () => {
     expect(persisted.chapters).toEqual(before.chapters);
   });
 
-  it("publishes all supported POST stream routes", () => {
+  it("guards delete-latest rollback against non-latest selection without mutating saved state", async () => {
+    const store = new WorldStore(new DatabaseSync(":memory:"));
+    const world = createTestWorld(store);
+    const before = store.saveWorldStory(rollbackStory(world.id));
+    reserveRollbackImage(store, world.id, "chapter-2-beat-1");
+    const recorder = jsonRecorder();
+
+    await deleteRoute(store, "/worlds/:worldId/story/chapters/:chapterId")
+      .handle({ params: { worldId: world.id, chapterId: "chapter-2" }, body: {} }, recorder.response, () => undefined);
+
+    expect(recorder.status()).toBe(409);
+    expect(store.getWorldStory(world.id)).toEqual(before);
+    expect(store.findStoryImage(world.id, "chapter-2-beat-1")).not.toBeNull();
+  });
+
+  it("rejects deleting the immutable first chapter and leaves its story assets intact", async () => {
+    const store = new WorldStore(new DatabaseSync(":memory:"));
+    const world = createTestWorld(store);
+    const source = rollbackStory(world.id);
+    const before = store.saveWorldStory({
+      ...source,
+      chapters: source.chapters.filter((chapter) => chapter.id === "chapter-1"),
+      perspectives: source.perspectives.filter((perspective) => perspective.chapterId === "chapter-1"),
+      characters: source.characters.filter((character) => character.introducedInChapter === "chapter-1"),
+    });
+    reserveRollbackImage(store, world.id, "chapter-1-beat-1");
+    const recorder = jsonRecorder();
+
+    await deleteRoute(store, "/worlds/:worldId/story/chapters/:chapterId")
+      .handle({ params: { worldId: world.id, chapterId: "chapter-1" }, body: {} }, recorder.response, () => undefined);
+
+    expect(recorder.status()).toBe(409);
+    expect(recorder.payload()).toEqual({ error: "Chapter 1 cannot be deleted" });
+    expect(store.getWorldStory(world.id)).toEqual(before);
+    expect(store.findStoryImage(world.id, "chapter-1-beat-1")).not.toBeNull();
+  });
+
+  it("deletes only the latest chapter and returns the newly selected surviving chapter", async () => {
+    const store = new WorldStore(new DatabaseSync(":memory:"));
+    const world = createTestWorld(store);
+    store.saveWorldStory(rollbackStory(world.id));
+    reserveRollbackImage(store, world.id, "chapter-2-beat-1");
+    reserveRollbackImage(store, world.id, "chapter-3-beat-1");
+    const recorder = jsonRecorder();
+
+    await deleteRoute(store, "/worlds/:worldId/story/chapters/:chapterId")
+      .handle({ params: { worldId: world.id, chapterId: "chapter-3" }, body: {} }, recorder.response, () => undefined);
+
+    const payload = recorder.payload() as { story: WorldStory; chapter: StoryChapter };
+    const persisted = store.getWorldStory(world.id)!;
+    expect(recorder.status()).toBe(200);
+    expect(payload.chapter).toMatchObject({ id: "chapter-2", number: 2 });
+    expect(persisted.chapters.map((chapter) => chapter.id)).toEqual(["chapter-1", "chapter-2"]);
+    expect(persisted.perspectives.map((perspective) => perspective.chapterId)).toEqual(["chapter-1", "chapter-2"]);
+    expect(persisted.characters.map((character) => character.id)).toEqual(["base-character", "chapter-two-character"]);
+    expect(persisted.upcomingDirections).toEqual(["Keep this queued direction after rollback."]);
+    expect(store.findStoryImage(world.id, "chapter-2-beat-1")).not.toBeNull();
+    expect(store.findStoryImage(world.id, "chapter-3-beat-1")).toBeNull();
+  });
+
+  it("deletes all future chapters, perspectives, cast additions, and image records while retaining the selected chapter", async () => {
+    const store = new WorldStore(new DatabaseSync(":memory:"));
+    const world = createTestWorld(store);
+    store.saveWorldStory(rollbackStory(world.id));
+    reserveRollbackImage(store, world.id, "chapter-1-beat-1");
+    reserveRollbackImage(store, world.id, "chapter-2-beat-1");
+    reserveRollbackImage(store, world.id, "chapter-2-chapter-two-character-beat-1");
+    reserveRollbackImage(store, world.id, "chapter-3-beat-1");
+    reserveRollbackImage(store, world.id, "chapter-3-chapter-three-character-beat-1");
+    const recorder = jsonRecorder();
+
+    await deleteRoute(store, "/worlds/:worldId/story/chapters/:chapterId/future")
+      .handle({ params: { worldId: world.id, chapterId: "chapter-1" }, body: {} }, recorder.response, () => undefined);
+
+    const payload = recorder.payload() as { story: WorldStory; chapter: StoryChapter };
+    const persisted = store.getWorldStory(world.id)!;
+    expect(recorder.status()).toBe(200);
+    expect(payload.chapter).toMatchObject({ id: "chapter-1", number: 1 });
+    expect(persisted.chapters.map((chapter) => chapter.id)).toEqual(["chapter-1"]);
+    expect(persisted.perspectives.map((perspective) => perspective.chapterId)).toEqual(["chapter-1"]);
+    expect(persisted.characters.map((character) => character.id)).toEqual(["base-character"]);
+    expect(persisted.upcomingDirections).toEqual(["Keep this queued direction after rollback."]);
+    expect(store.findStoryImage(world.id, "chapter-1-beat-1")).not.toBeNull();
+    expect(store.findStoryImage(world.id, "chapter-2-beat-1")).toBeNull();
+    expect(store.findStoryImage(world.id, "chapter-2-chapter-two-character-beat-1")).toBeNull();
+    expect(store.findStoryImage(world.id, "chapter-3-beat-1")).toBeNull();
+    expect(store.findStoryImage(world.id, "chapter-3-chapter-three-character-beat-1")).toBeNull();
+  });
+
+  it("publishes all supported stream and rollback routes", () => {
     const router = createStoryRouter(new WorldStore(new DatabaseSync(":memory:"))) as unknown as { stack: RouteLayer[] };
-    const paths = router.stack.filter((layer) => layer.route?.methods.post).map((layer) => layer.route?.path);
-    expect(paths).toEqual(expect.arrayContaining([
+    const postPaths = router.stack.filter((layer) => layer.route?.methods.post).map((layer) => layer.route?.path);
+    const deletePaths = router.stack.filter((layer) => layer.route?.methods.delete).map((layer) => layer.route?.path);
+    expect(postPaths).toEqual(expect.arrayContaining([
       "/worlds/:worldId/story/next/stream",
       "/worlds/:worldId/story/command/stream",
       "/worlds/:worldId/story/perspective/stream",
       "/worlds/:worldId/story/revise/stream",
+    ]));
+    expect(deletePaths).toEqual(expect.arrayContaining([
+      "/worlds/:worldId/story/chapters/:chapterId",
+      "/worlds/:worldId/story/chapters/:chapterId/future",
     ]));
   });
 });

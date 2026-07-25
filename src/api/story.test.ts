@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { addUpcomingDirection, reviseChapter } from "./story";
+import { addUpcomingDirection, deleteFutureChapters, deleteLatestChapter, reviseChapter } from "./story";
 
 function jsonResponse(payload: unknown, status = 200): Response {
   return new Response(JSON.stringify(payload), {
@@ -47,5 +47,22 @@ describe("story revision and direction API client", () => {
     vi.stubGlobal("fetch", vi.fn().mockResolvedValue(jsonResponse({ error: "A revision prompt is required" }, 400)));
 
     await expect(reviseChapter("test-world", "")).rejects.toThrow("A revision prompt is required");
+  });
+
+  it("uses the selected rollback endpoints and returns their surviving chapter contract", async () => {
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(jsonResponse({ story: { worldId: "test-world" }, chapter: { id: "chapter-2", number: 2, title: "Two", narration: "", beats: [] } }))
+      .mockResolvedValueOnce(jsonResponse({ story: { worldId: "test-world" }, chapter: { id: "chapter-1", number: 1, title: "One", narration: "", beats: [] } }));
+    vi.stubGlobal("fetch", fetchMock);
+
+    await expect(deleteLatestChapter("world / one", "chapter / 2")).resolves.toMatchObject({ chapter: { id: "chapter-2", number: 2 } });
+    await expect(deleteFutureChapters("world-two", "chapter-1")).resolves.toMatchObject({ chapter: { id: "chapter-1", number: 1 } });
+
+    expect(fetchMock.mock.calls.map(([path]) => path)).toEqual([
+      "/api/worlds/world%20%2F%20one/story/chapters/chapter%20%2F%202",
+      "/api/worlds/world-two/story/chapters/chapter-1/future",
+    ]);
+    expect(fetchMock.mock.calls[0]?.[1]).toMatchObject({ method: "DELETE" });
+    expect(fetchMock.mock.calls[1]?.[1]).toMatchObject({ method: "DELETE" });
   });
 });

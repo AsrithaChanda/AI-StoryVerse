@@ -11,6 +11,8 @@ export type StoryCharacter = {
   personality: string;
   goal: string;
   memories: string[];
+  /** Canonical chapter that made this persistent character part of the cast. */
+  introducedInChapter?: string;
 };
 
 export type StoryBeat = { id: string; description: string; caption: string };
@@ -136,6 +138,10 @@ function normalizeAdditionalCharacters(value: unknown, existing: StoryCharacter[
   return additions;
 }
 
+function tagCharacterOrigins(characters: StoryCharacter[], chapterId: string): StoryCharacter[] {
+  return characters.map((character) => ({ ...character, introducedInChapter: chapterId }));
+}
+
 /** Provider beat labels repeat frequently (for example, `beat_01`). IDs are
  * canonical scene identities, so every chapter owns a distinct image cache. */
 function normalizeChapter(payload: StoryChapter, number: number, command?: string, revision = 1): StoryChapter {
@@ -256,7 +262,7 @@ export async function generateInitialStory(world: World): Promise<WorldStory> {
   const characters = normalizeAdditionalCharacters(payload.characters, []);
   if (!characters || characters.length === 0) return emptyStory(world.id);
   const chapter = normalizeChapter(payload.chapter, 1);
-  return { worldId: world.id, characters, chapters: [chapter], perspectives: [], upcomingDirections: [], worldState: payload.worldState, source: "openai", createdAt: time, updatedAt: time };
+  return { worldId: world.id, characters: tagCharacterOrigins(characters, chapter.id), chapters: [chapter], perspectives: [], upcomingDirections: [], worldState: payload.worldState, source: "openai", createdAt: time, updatedAt: time };
 }
 
 type NextChapterPayload = StoryChapter & { newCharacters?: unknown };
@@ -281,7 +287,7 @@ function normalizeNextChapter(payload: NextChapterPayload, story: WorldStory, pr
   // New cast members are permitted only as part of fulfilling a pending
   // direction; reject an unexpected expansion instead of silently dropping it.
   if (directions.length === 0 && newCharacters.length > 0) return null;
-  return { chapter, newCharacters };
+  return { chapter, newCharacters: tagCharacterOrigins(newCharacters, chapter.id) };
 }
 
 export async function generateNextChapter(world: World, story: WorldStory, command?: string): Promise<NextChapterGeneration | null> {
@@ -324,7 +330,8 @@ export async function reviseLatestChapter(world: World, story: WorldStory, promp
   if (!payload?.narration || !Array.isArray(payload.beats)) return null;
   const newCharacters = normalizeAdditionalCharacters(payload.newCharacters ?? [], story.characters);
   if (!newCharacters) return null;
-  return { chapter: normalizeChapter(payload, request.current.number, request.current.command, request.revision), newCharacters };
+  const chapter = normalizeChapter(payload, request.current.number, request.current.command, request.revision);
+  return { chapter, newCharacters: tagCharacterOrigins(newCharacters, chapter.id) };
 }
 
 /** Stream a revision while keeping raw structured JSON on the server. */
@@ -340,7 +347,8 @@ export async function reviseLatestChapterStream(
   if (!payload?.narration || !Array.isArray(payload.beats)) return null;
   const newCharacters = normalizeAdditionalCharacters(payload.newCharacters ?? [], story.characters);
   if (!newCharacters) return null;
-  return { chapter: normalizeChapter(payload, request.current.number, request.current.command, request.revision), newCharacters };
+  const chapter = normalizeChapter(payload, request.current.number, request.current.command, request.revision);
+  return { chapter, newCharacters: tagCharacterOrigins(newCharacters, chapter.id) };
 }
 
 export async function generatePerspective(world: World, story: WorldStory, characterId: string): Promise<Perspective | null> {

@@ -1,6 +1,6 @@
 import { Fragment, useEffect, useMemo, useRef, useState } from "react";
 import type { StoryBeat, StoryChapter, WorldStory } from "../api/story";
-import { addUpcomingDirection, bootstrapStory } from "../api/story";
+import { addUpcomingDirection, bootstrapStory, deleteFutureChapters, deleteLatestChapter } from "../api/story";
 import { streamCharacterPerspective, streamNextChapter, streamReviseChapter, type StoryGenerationStage as StoryGenerationPhase } from "../api/story-stream";
 import type { World } from "../api/worlds";
 import { generateSceneImage, loadSceneImage } from "../images/api";
@@ -8,6 +8,7 @@ import { prepareChapterImages } from "../images/chapter-preparation";
 import type { StoryImage } from "../images/contracts";
 import ChapterBgm from "./ChapterBgm";
 import ChapterNarration from "./ChapterNarration";
+import ChapterTimelineActions from "./ChapterTimelineActions";
 import type { AudioPlan } from "../audio/chapter-audio";
 import SceneImage from "./SceneImage";
 import StoryAuthorControls from "./StoryAuthorControls";
@@ -34,6 +35,7 @@ export default function GeneratedWorldReader({ world, close }: { world: World; c
   const [illustrationProgress, setIllustrationProgress] = useState<IllustrationProgress | null>(null);
   const [audioPlan, setAudioPlan] = useState<AudioPlan | null>(null);
   const [perspectiveLoading, setPerspectiveLoading] = useState<PerspectiveLoading | null>(null);
+  const [rollbackVersion, setRollbackVersion] = useState(0);
   const illustrationTask = useRef(0);
 
   useEffect(() => {
@@ -214,6 +216,48 @@ export default function GeneratedWorldReader({ world, close }: { world: World; c
     }
   };
 
+  /**
+   * A destructive timeline change has to invalidate the reader's transient
+   * point of view and any in-flight illustration callbacks. The server owns
+   * the atomic persistence rollback; the reader then opens the chapter it
+   * explicitly reports as still surviving.
+   */
+  const applyRollback = (next: WorldStory, survivingChapter: StoryChapter) => {
+    illustrationTask.current += 1;
+    setIllustrationProgress(null);
+    setStoredImages({});
+    setStory(next);
+    showNarratorChapter(survivingChapter);
+  };
+
+  const removeLatestChapter = async () => {
+    if (!story || !chapter || !isLatestChapter || chapterIndex <= 0 || busy || illustrationProgress) return;
+    setBusy(true); setError(undefined); setAudioPlan(null);
+    try {
+      const result = await deleteLatestChapter(world.id, chapter.id);
+      applyRollback(result.story, result.chapter);
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : "This chapter could not be deleted. The timeline was left unchanged.");
+    } finally {
+      setBusy(false);
+      setRollbackVersion((version) => version + 1);
+    }
+  };
+
+  const removeFutureChapters = async () => {
+    if (!story || !chapter || chapterIndex < 0 || chapterIndex >= story.chapters.length - 1 || busy || illustrationProgress) return;
+    setBusy(true); setError(undefined); setAudioPlan(null);
+    try {
+      const result = await deleteFutureChapters(world.id, chapter.id);
+      applyRollback(result.story, result.chapter);
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : "The future chapters could not be deleted. The timeline was left unchanged.");
+    } finally {
+      setBusy(false);
+      setRollbackVersion((version) => version + 1);
+    }
+  };
+
   const retryBootstrap = () => {
     setBusy(true); setError(undefined);
     void bootstrapStory(world.id).then(({ story: next }) => updateFromStory(next))
@@ -232,6 +276,19 @@ export default function GeneratedWorldReader({ world, close }: { world: World; c
               <span>CHAPTER {chapter.number} OF {story.chapters.length}</span>
               <button type="button" onClick={() => showNarratorChapter(story.chapters[chapterIndex + 1])} disabled={chapterIndex >= story.chapters.length - 1}>Next →</button>
             </nav>}
+            {/* A rollback changes the selected timeline. Remount the action
+              surface once the request settles so a completed confirmation
+              cannot remain open for a new chapter or obscure a server error. */}
+            <ChapterTimelineActions
+              key={`${chapter.id}-${story.chapters.length}-${rollbackVersion}`}
+              selectedChapterNumber={chapter.number}
+              isLatest={isLatestChapter}
+              hasPreviousChapter={chapterIndex > 0}
+              hasFutureChapters={chapterIndex >= 0 && chapterIndex < story.chapters.length - 1}
+              busy={busy || Boolean(illustrationProgress)}
+              onDeleteCurrent={() => void removeLatestChapter()}
+              onDeleteFuture={() => void removeFutureChapters()}
+            />
             <p className="eyebrow">CHAPTER {chapter.number}</p>
             <h1>{chapter.title}</h1>
             <div className={`perspective-banner ${activeCharacter || openingCharacterName ? "perspective-banner--character" : ""}`}>
