@@ -1,5 +1,6 @@
 export type ImageStatus = "pending" | "ready" | "failed" | "fallback";
-export type ImageMoment = "world_cover" | "opening" | "trust_kael" | "expose_kael" | "ravi_pov" | "chapter_scene" | "perspective_scene";
+/** Generic story surfaces only. A persisted world supplies the actual scene details. */
+export type ImageMoment = "world_cover" | "chapter_scene" | "perspective_scene";
 
 /** Server-only representation; `prompt` and retry metadata never leave the API. */
 export type StoredStoryImage = {

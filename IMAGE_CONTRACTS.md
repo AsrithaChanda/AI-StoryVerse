@@ -1,9 +1,7 @@
-# Story image integration contract
+# Story image contract
 
-- Shared client type: `src/images/contracts.ts` (lead owned).
-- Pipeline/API/SQLite cache: Agent A owns `server/images/**`, `server/image-routes.ts`, and `server/worlds.ts`.
-- Visual image components: Agent B owns `src/components/SceneImage.tsx`, `src/components/WorldImage.tsx`, and `src/styles/images.css`.
-- Tests and E2E documentation: Agent C owns `server/images.test.ts` and `e2e/story-images.md`.
-- Lead owns API mounting, controller/UI composition, metadata, docs, review, and build fixes.
-
-Images are optional and asynchronous. The reducer commits canonical consequences first; image work is never an input to story state.
+- Client image moments are limited to `world_cover`, `chapter_scene`, and `perspective_scene`.
+- The browser sends a world ID, scene ID, approved moment, and optional character perspective ID; it never sends a raw image prompt.
+- The server loads persisted world and chapter context, builds the provider prompt, and caches the resulting image by world, scene, moment, perspective, and prompt version.
+- Image generation is asynchronous and non-blocking. The reader remains usable while an image is loading, unavailable, or retried.
+- A character-perspective image must use only the selected character’s saved scene context.

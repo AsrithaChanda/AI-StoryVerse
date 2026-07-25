@@ -11,7 +11,7 @@ export type World = {
   creatorPrompt: string;
   openingScene: string;
   characters: Array<{ name: string; role: string; trait: string }>;
-  source: "seed" | "openai" | "fallback";
+  source: "openai" | "fallback";
   createdAt: string;
 };
 
@@ -19,14 +19,12 @@ export type CreateWorldInput = Pick<World, "title" | "premise" | "genre" | "crea
 
 type WorldRow = Omit<World, "characters" | "source"> & { characters_json: string; source: World["source"] };
 
-const lastEmber: Omit<World, "createdAt"> = {
-  id: "the-last-ember", title: "The Last Ember", genre: "Fantasy mystery",
-  premise: "A floating city survives on a failing Ember Core. At the eastern bridge, a courier must decide whether a prince’s secret is worth saving Astra.",
-  creatorPrompt: "A cinematic fantasy mystery about trust, a failing power source, and a city above the clouds.",
-  openingScene: "Warning bells cross the eastern bridge. Mira Sen corners Prince Kael beneath the amber lamps, and the stolen Ember fragment glows once between them.",
-  characters: [{ name: "Mira Sen", role: "Palace courier", trait: "Brave and impulsive" }, { name: "Ravi", role: "Retired royal guard", trait: "Protective and suspicious" }, { name: "Prince Kael", role: "Heir to Astra", trait: "Idealistic and secretive" }],
-  source: "seed",
-};
+/**
+ * The former demo universe was seeded under this ID. Keep only the stable ID
+ * long enough to safely clean it from existing local databases; no story copy
+ * or seed data remains in the application.
+ */
+const LEGACY_SEEDED_WORLD_ID = "the-last-ember";
 
 function rowToWorld(row: WorldRow): World {
   return { id: row.id, title: row.title, premise: row.premise, genre: row.genre, creatorPrompt: row.creatorPrompt, openingScene: row.openingScene, characters: JSON.parse(row.characters_json) as World["characters"], source: row.source, createdAt: row.createdAt };
@@ -68,8 +66,31 @@ export class WorldStore {
       updated_at TEXT NOT NULL,
       FOREIGN KEY(world_id) REFERENCES worlds(id)
     )`);
+    this.removeLegacySeededWorld();
     this.normalizeLegacyFallbackBlueprints();
-    this.seed();
+  }
+
+  /**
+   * Existing local installs may still contain the retired demo world. Delete
+   * exactly its related records before its world row, in one transaction. The
+   * predicates deliberately use the stable legacy ID so user-created worlds,
+   * including worlds with similar titles or genres, are untouched.
+   */
+  private removeLegacySeededWorld(): void {
+    this.db.exec("BEGIN");
+    try {
+      this.db.prepare("DELETE FROM story_images WHERE world_id = ?").run(LEGACY_SEEDED_WORLD_ID);
+      this.db.prepare("DELETE FROM world_stories WHERE world_id = ?").run(LEGACY_SEEDED_WORLD_ID);
+      this.db.prepare("DELETE FROM worlds WHERE id = ?").run(LEGACY_SEEDED_WORLD_ID);
+      this.db.exec("COMMIT");
+    } catch (error) {
+      try {
+        this.db.exec("ROLLBACK");
+      } catch {
+        // Preserve the original database error if a rollback itself fails.
+      }
+      throw error;
+    }
   }
 
   /** Removes the former canned fallback prose/cast from already-created worlds. */
@@ -88,12 +109,6 @@ export class WorldStore {
         // Preserve any unrelated user data that cannot be parsed.
       }
     }
-  }
-
-  private seed(): void {
-    const exists = this.db.prepare("SELECT id FROM worlds WHERE id = ?").get(lastEmber.id);
-    if (exists) return;
-    this.insert({ ...lastEmber, createdAt: "2026-01-01T00:00:00.000Z" });
   }
 
   private insert(world: World): void {

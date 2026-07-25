@@ -1,5 +1,5 @@
 export type ImageStatus = "pending" | "ready" | "failed" | "fallback";
-export type ImageMoment = "world_cover" | "opening" | "trust_kael" | "expose_kael" | "ravi_pov" | "chapter_scene" | "perspective_scene";
+export type ImageMoment = "world_cover" | "chapter_scene" | "perspective_scene";
 
 export type StoryImage = {
   id: string;

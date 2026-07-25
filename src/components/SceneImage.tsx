@@ -32,12 +32,8 @@ export type SceneImageProps = {
 };
 
 const MOMENT_LABEL: Record<SceneImageRequest["moment"], string> = {
-  opening: "Opening moment",
-  trust_kael: "Amber timeline · Trust Kael",
-  expose_kael: "Violet timeline · Expose Kael",
-  ravi_pov: "Ravi’s point of view",
   chapter_scene: "Chapter illustration",
-  perspective_scene: "Character point of view",
+  perspective_scene: "Character perspective",
 };
 
 type UsableStoryImage = StoryImage & { status: "ready"; imageUrl: string };
@@ -70,8 +66,8 @@ export default function SceneImage({ image, moment, worldId, sceneId, branchId, 
 
   const shown = image ?? (resolved?.key === requestKey ? resolved.image : undefined);
   const ready = isUsable(shown);
-  const accent = moment === "expose_kael" ? "violet" : "amber";
-  const pov = Boolean(protagonistId) || moment === "ravi_pov";
+  const accent = moment === "perspective_scene" ? "violet" : "amber";
+  const pov = Boolean(protagonistId);
   const failed = failedKey === requestKey || shown?.status === "failed";
   const automaticLoading = Boolean(loadImage && !ready && !failed && shown?.status !== "failed");
   const status = failed ? "failed" : retrying || automaticLoading || shown?.status === "pending" ? "loading" : ready ? "ready" : "fallback";

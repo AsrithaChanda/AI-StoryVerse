@@ -1,22 +1,19 @@
-# StoryVerse integration contract
+# StoryVerse integration contracts
 
-## Ownership
+## Product flow
 
-| Area | Owner | Allowed paths |
-| --- | --- | --- |
-| App shell, controller, persistence bridge, metadata, docs | Lead | `src/App.tsx`, `src/main.tsx`, `src/controller.ts`, `src/persistence.ts`, root config/docs |
-| Visual UI | Agent A | `src/components/**`, `src/styles/**` |
-| Canonical story engine | Agent B | `src/domain/**` |
-| AI scene adapter and generation tests | Agent C | `src/ai/**`, `e2e/**` |
+1. The product home renders only explanatory content and saved user-created worlds.
+2. `POST /api/worlds` persists a brief and returns a world record.
+3. `GeneratedWorldReader` bootstraps the selected world’s Chapter 1 through the story API.
+4. All chapters, perspectives, image records, and narration assets remain scoped to that world ID.
 
-## Domain contract (Agent B)
+## Core data boundaries
 
-Export `StoryViewState`, `StoryState`, `Decision`, `CharacterId`, `createInitialState`, `commitDecision`, `createAlternateBranch`, `switchBranch`, `switchProtagonist`, `resetStory`, and `getCharacterView` from `src/domain/index.ts`. Reducers are pure and immutable.
+- A world brief, canonical chapter, character perspective, image prompt, and narrated text are distinct records.
+- Image prompts are rebuilt server-side from persisted world/chapter context; clients cannot supply arbitrary provider prompts.
+- Character perspectives use the selected character’s generated context and must not be labelled or narrated as the canonical view.
+- Narration uses the exact visible source text identified by its content hash.
 
-## AI contract (Agent C)
+## UI boundary
 
-Export `SceneGenerationInput`, `GeneratedScene`, `createSceneGenerator`, `buildSceneInput` from `src/ai/index.ts`. The generator must use a no-key fallback by default and never expose Kael's private secret in Ravi inputs.
-
-## UI contract (Agent A)
-
-Export a default `StoryExperience` from `src/components/StoryExperience.tsx` accepting `{ state: StoryViewState; actions: StoryActions }`, with `StoryActions` exported from that file. UI calls only actions and receives no reducer/provider internals.
+`StoryExperience` owns the product home and world-creation experience. `GeneratedWorldReader` owns an opened world’s chapter, perspective, image, BGM, and narration interactions.

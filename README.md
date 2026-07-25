@@ -1,51 +1,57 @@
-# StoryVerse — The Last Ember
+# StoryVerse
 
-An offline-first hackathon MVP for an interactive story universe. One choice at Astra's eastern bridge changes structured world state, each character remembers it differently, and the Story Time Machine preserves both futures.
+StoryVerse is an AI-native story creation studio for building original, persistent story worlds. A creator supplies a title, genre, core premise, and creative direction; StoryVerse saves the world, generates a cinematic Chapter 1, and supports ongoing chapters, character perspectives, illustrations, narration, and scene-aware background music.
+
+No prewritten or seeded story universe is included. The archive starts empty and contains only worlds created by the user.
+
+## What creators can do
+
+- Create an original world from a short creative brief.
+- Browse and reopen worlds in the persistent World Atlas.
+- Generate a Chapter 1 with a persistent cast, chapter beats, and world state.
+- Continue the story chapter by chapter or direct the next chapter with an author command.
+- Switch the current chapter to a selected character’s point of view.
+- Generate and cache cinematic illustrations for chapter beats and character perspectives.
+- Listen to the displayed canonical or character-perspective prose with selected narration speed and restart controls.
+- Hear a scene-appropriate local BGM track selected by the chapter-audio director.
 
 ## Quick start
 
 ```bash
 npm install
+cp .env.example .env
 npm run dev
 ```
 
-Open the local URL printed by Vite. The experience is fully demonstrable with no API key.
+Open the local Vite URL shown in the terminal. The API creates `data/storyverse.db` automatically.
+
+## Optional environment
+
+Add `OPENAI_API_KEY` to `.env` to enable live world, chapter, perspective, image, and narration generation. Credentials remain server-side.
+
+- `OPENAI_MODEL` — structured world and chapter generation (configured for `gpt-5.6-luna`)
+- `OPENAI_IMAGE_MODEL` — image generation
+- `OPENAI_NARRATION_MODEL` — exact-text narration through `gpt-4o-mini-tts`
+
+Without a key, creators can still save and browse world briefs. Live Chapter 1, perspective, illustration, and narration generation require the configured provider.
+
+## Architecture
+
+- `src/components/StoryExperience.tsx` — professional product home, use cases, World Atlas, and world-creation dialog.
+- `src/components/GeneratedWorldReader.tsx` — chapter reader, character perspective switcher, author commands, archive navigation, images, BGM, and narration controls.
+- `server/` — Express API, structured generation, image pipeline, chapter-audio director, and SQLite persistence.
+- `data/storyverse.db` — local archive for worlds, persistent chapters, perspectives, and image metadata.
+- `data/story-images/` and `data/story-narrations/` — persisted generated assets.
 
 ## Commands
 
 ```bash
-npm test
 npm run typecheck
 npm run lint
+npm test
 npm run build
 ```
 
-## Architecture
+## Current scope
 
-- `server/` — Express API and SQLite world archive. `POST /api/worlds` creates worlds; `GET /api/worlds` explores them; `GET /api/worlds/:id` retrieves one.
-- `data/storyverse.db` — local SQLite database created automatically on first API startup (ignored by Git).
-- `src/api/worlds.ts` — typed browser client for the world archive.
-- `server/images/` — server-only OpenAI image-provider adapter, canonical visual prompt builder, local asset storage, and SQLite-backed cache metadata.
-- `server/chapter-audio-director.ts` — chapter-audio director: it selects a local CC0 BGM by scene emotion and chooses the narration persona and dedicated TTS voice for a chapter or POV.
-- `server/story.ts` and `server/story-routes.ts` — structured Chapter 1, next-chapter, author-command, and character-perspective generation for created worlds; persistent story state lives in SQLite.
-- `server/image-routes.ts` — secure image endpoints; clients request approved story moments rather than sending raw image prompts.
-- `src/components/SceneImage.tsx` and `src/components/WorldImage.tsx` — responsive visual frames with immediate fallback art, non-blocking loading, retry, and accessible status text.
-- `src/domain/` — immutable canonical story engine, seed data, deterministic consequences, branch snapshots, and knowledge boundaries for The Last Ember.
-- `src/ai/` — validated scene-generation adapter; it retries once and uses authored fallback scenes with no model key.
-- `src/components/` — cinematic reader, memory drawer, timeline, and responsive styling.
-- `src/controller.ts` — client orchestration and idempotent interaction boundary.
-- `src/persistence.ts` — browser-local saved demo state.
-
-World truth, character beliefs, memories, and narration are intentionally separate. The reducer decides consequences; generated prose only presents them.
-
-## Optional environment
-
-Copy `.env.example` to `.env` and set `OPENAI_API_KEY` to enable server-side generation. `OPENAI_MODEL` is the structured story writer; `OPENAI_IMAGE_MODEL` renders scene images; and `OPENAI_NARRATION_MODEL=gpt-4o-mini-tts` reads the exact saved chapter or selected-POV prose on demand. The audio director selects a bundled CC0 BGM by emotion—music is not generated by the voice model. Narration WAV files persist under `data/story-narrations/`; image files persist under `data/story-images/`. Never put a provider key in a browser bundle.
-
-## Demo path
-
-From the landing screen, choose **Create a world** to add a database-backed universe or browse **World Atlas**. Opening a created world boots a persistent AI-written Chapter 1 with imageable beats; choose a cast member for their POV, give an author command, or generate the next chapter. Then enter **The Last Ember** → trust Kael → inspect Ravi → continue as Ravi → open the Time Machine → create the Expose Kael future → compare Timeline A/B → reset.
-
-## Scope
-
-This hackathon build deliberately excludes accounts, payments, multiplayer, and arbitrary-depth branching. Live generation is optional and always has a durable fallback.
+StoryVerse currently supports linear, persistent chapter continuations per created world. Authentication, payments, collaboration, world sharing, and arbitrary branch/merge editing are intentionally outside this build.

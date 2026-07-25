@@ -113,7 +113,10 @@ export async function generateInitialStory(world: World): Promise<WorldStory> {
 export async function generateNextChapter(world: World, story: WorldStory, command?: string): Promise<StoryChapter | null> {
   const previous = story.chapters.at(-1);
   if (!previous || story.characters.length === 0) return null;
-  const chapterSchema = { type: "object", additionalProperties: false, required: ["id", "number", "title", "narration", "beats"], properties: schema.properties.chapter.properties };
+  // OpenAI strict JSON schemas require every declared property to be listed as
+  // required. audioDirection was added to the chapter contract later; omitting
+  // it here caused next-chapter provider requests to be rejected before writing.
+  const chapterSchema = { type: "object", additionalProperties: false, required: ["id", "number", "title", "narration", "beats", "audioDirection"], properties: schema.properties.chapter.properties };
   const payload = await modelJson<StoryChapter>(
     `You continue an original StoryVerse serial. ${originalGuard} Preserve every character's visual description, personality, goal, and memories. Advance exactly one chapter with three to four imageable beats. Set audioDirection from the new chapter's actual emotional context: select the primary and secondary emotion, intensity 0–1, local BGM cue, and a concise narration delivery.`,
     `World: ${world.title}\nPremise: ${world.premise}\nWorld state: ${story.worldState}\nCharacters: ${JSON.stringify(story.characters)}\nPrevious chapter: ${previous.narration}\nAuthor command: ${command ?? "Continue the central conflict naturally."}\nWrite chapter ${previous.number + 1}.`, chapterSchema,

@@ -3,15 +3,22 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { generateWorld } from "./generation.js";
 import { WorldStore } from "./worlds.js";
 
+function createWorld(store: WorldStore, title = "The Glass Horizon") {
+  return store.create(
+    { title, genre: "Solarpunk mystery", premise: "A city sails between storms.", creatorPrompt: "Tender, strange, and suspenseful." },
+    { source: "fallback", openingScene: "The first storm speaks in the old language at dawn, and everyone on the deck hears their own name.", characters: [] },
+  );
+}
+
 describe("world archive", () => {
   afterEach(() => vi.unstubAllEnvs());
 
-  it("seeds The Last Ember and persists a created world in SQLite", () => {
+  it("starts with an empty archive and persists a created world in SQLite", () => {
     const store = new WorldStore(new DatabaseSync(":memory:"));
-    expect(store.list()).toHaveLength(1);
-    const created = store.create({ title: "The Glass Horizon", genre: "Solarpunk mystery", premise: "A city sails between storms.", creatorPrompt: "Tender, strange, and suspenseful." }, { source: "fallback", openingScene: "The first storm speaks in the old language at dawn, and everyone on the deck hears their own name.", characters: [{ name: "Ari", role: "Navigator", trait: "Fearless" }, { name: "Sol", role: "Archivist", trait: "Patient" }, { name: "Vale", role: "Warden", trait: "Secretive" }] });
+    expect(store.list()).toEqual([]);
+    const created = createWorld(store);
     expect(store.get(created.id)?.title).toBe("The Glass Horizon");
-    expect(store.list()).toHaveLength(2);
+    expect(store.list()).toHaveLength(1);
   });
 
   it("keeps offline world blueprints free of invented character records", async () => {
@@ -33,24 +40,52 @@ describe("world archive", () => {
     expect(migrated.get("bahubali")?.openingScene).toBe("The story opens in Bahubali. A kingdom faces its past.");
   });
 
+  it("removes only the retired seeded world and its stored story and image rows", () => {
+    const database = new DatabaseSync(":memory:");
+    const initial = new WorldStore(database);
+    const created = createWorld(initial, "A User-Created Archive");
+    const timestamp = "2026-01-01T00:00:00.000Z";
+
+    database.prepare(`INSERT INTO worlds (id,title,premise,genre,creator_prompt,opening_scene,characters_json,source,created_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+      .run("the-last-ember", "The Last Ember", "Retired demo", "Fantasy", "Retired demo", "Retired demo opening.", "[]", "seed", timestamp);
+    database.prepare("INSERT INTO world_stories (world_id, story_json, created_at, updated_at) VALUES (?, ?, ?, ?)")
+      .run("the-last-ember", JSON.stringify({ worldId: "the-last-ember", chapters: [] }), timestamp, timestamp);
+    database.prepare(`INSERT INTO story_images (
+      id, cache_key, world_id, branch_id, scene_id, protagonist_id,
+      character_ids_json, prompt_version, prompt, status, image_url,
+      fallback_url, provider, provider_asset_id, error_code, retry_count,
+      created_at, updated_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+      .run("legacy-image", "legacy-image-cache-key", "the-last-ember", null, "legacy-scene", null, "[]", "legacy", "legacy image", "ready", "https://example.test/legacy.png", "data:image/svg+xml;base64,", null, null, null, 0, timestamp, timestamp);
+
+    const migrated = new WorldStore(database);
+    expect(migrated.get("the-last-ember")).toBeNull();
+    expect(migrated.get(created.id)?.title).toBe("A User-Created Archive");
+    expect(database.prepare("SELECT COUNT(*) AS count FROM world_stories WHERE world_id = ?").get("the-last-ember")).toMatchObject({ count: 0 });
+    expect(database.prepare("SELECT COUNT(*) AS count FROM story_images WHERE world_id = ?").get("the-last-ember")).toMatchObject({ count: 0 });
+  });
+
   it("migrates old repeated beat labels into distinct saved chapter image identities", () => {
     const store = new WorldStore(new DatabaseSync(":memory:"));
+    const world = createWorld(store, "Image Archive");
     store.saveWorldStory({
-      worldId: "the-last-ember", characters: [], perspectives: [], worldState: "The city is waiting for the next signal from the eastern bridge.", source: "openai", createdAt: "2026-01-01T00:00:00.000Z", updatedAt: "2026-01-01T00:00:00.000Z",
+      worldId: world.id, characters: [], perspectives: [], worldState: "The city is waiting for the next signal from the eastern bridge.", source: "openai", createdAt: "2026-01-01T00:00:00.000Z", updatedAt: "2026-01-01T00:00:00.000Z",
       chapters: [
         { id: "chapter_01", number: 1, title: "One", narration: "The opening chapter preserves a first visual memory for this world.", beats: [{ id: "beat_01", description: "A gold bridge", caption: "Gold bridge" }] },
         { id: "chapter_02", number: 2, title: "Two", narration: "The second chapter preserves a different visual memory for the same world.", beats: [{ id: "beat_01", description: "A violet storm", caption: "Violet storm" }] },
       ],
     });
-    const migrated = store.getWorldStory("the-last-ember")!;
+    const migrated = store.getWorldStory(world.id)!;
     expect(migrated.chapters.map((chapter) => chapter.id)).toEqual(["chapter-1", "chapter-2"]);
     expect(migrated.chapters.map((chapter) => chapter.beats[0].id)).toEqual(["chapter-1-beat-1", "chapter-2-beat-1"]);
-    expect(store.getWorldStory("the-last-ember")?.chapters[1].beats[0].id).toBe("chapter-2-beat-1");
+    expect(store.getWorldStory(world.id)?.chapters[1].beats[0].id).toBe("chapter-2-beat-1");
   });
 
   it("removes legacy raw author commands from visible world state", () => {
     const store = new WorldStore(new DatabaseSync(":memory:"));
-    store.saveWorldStory({ worldId: "the-last-ember", characters: [], chapters: [], perspectives: [], source: "openai", createdAt: "2026-01-01T00:00:00.000Z", updatedAt: "2026-01-01T00:00:00.000Z", worldState: "A storm threatens Chandraka. Author direction: add thunder. Author direction: save Arin." });
-    expect(store.getWorldStory("the-last-ember")?.worldState).toBe("A storm threatens Chandraka.");
+    const world = createWorld(store, "State Archive");
+    store.saveWorldStory({ worldId: world.id, characters: [], chapters: [], perspectives: [], source: "openai", createdAt: "2026-01-01T00:00:00.000Z", updatedAt: "2026-01-01T00:00:00.000Z", worldState: "A storm threatens Chandraka. Author direction: add thunder. Author direction: save Arin." });
+    expect(store.getWorldStory(world.id)?.worldState).toBe("A storm threatens Chandraka.");
   });
 });

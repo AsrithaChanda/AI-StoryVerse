@@ -6,7 +6,7 @@ import { LocalImageAssetStore } from "./images/assets.js";
 import { createStoryImagePipeline, StoryImagePipeline } from "./images/pipeline.js";
 import { ImageGenerationError, type ImageGenerator, type ImageRequest } from "./images/types.js";
 
-const momentSchema = z.enum(["world_cover", "opening", "trust_kael", "expose_kael", "ravi_pov", "chapter_scene", "perspective_scene"]);
+const momentSchema = z.enum(["world_cover", "chapter_scene", "perspective_scene"]);
 const idSchema = z.string().trim().min(1).max(100).regex(/^[a-zA-Z0-9_-]+$/, "Invalid identifier");
 const imageRequestSchema = z.object({
   worldId: idSchema,

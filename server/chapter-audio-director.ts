@@ -30,8 +30,8 @@ function moodOf(text: string): string {
 
 function characterPresentation(character: StoryCharacter): NarratorProfile["genderPresentation"] {
   const cues = `${character.name} ${character.role} ${character.visualDescription}`.toLowerCase();
-  if (/\b(woman|girl|female|heroine|queen|princess|sister|mother|daughter|she|her)\b/.test(cues) || /^(mara|sada|mira|sora|meilin)\b/.test(cues)) return "feminine";
-  if (/\b(man|boy|male|hero|king|prince|brother|father|son|he|him)\b/.test(cues) || /^(ilyan|tomas|arin|rudran|tavish|tavian|oren|ravi|kael)\b/.test(cues)) return "masculine";
+  if (/\b(woman|girl|female|heroine|queen|princess|sister|mother|daughter|she|her)\b/.test(cues)) return "feminine";
+  if (/\b(man|boy|male|hero|king|prince|brother|father|son|he|him)\b/.test(cues)) return "masculine";
   return "neutral";
 }
 

@@ -6,7 +6,7 @@ export type World = {
   creatorPrompt: string;
   openingScene: string;
   characters: Array<{ name: string; role: string; trait: string }>;
-  source: "seed" | "openai" | "fallback";
+  source: "openai" | "fallback";
   createdAt: string;
 };
 

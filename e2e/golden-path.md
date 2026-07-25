@@ -1,26 +1,12 @@
-# StoryVerse browser golden-path scaffold
+# StoryVerse browser acceptance checklist
 
-The application does not currently include Playwright/Cypress, so this is a
-framework-free, executable acceptance checklist for the in-app browser workflow.
-It deliberately uses the visible UI and does not depend on an API key.
-
-1. Start `npm run dev` and open the displayed local URL at desktop width.
-2. Confirm the **The Last Ember** landing title and select **Enter the story**.
-3. Tab to **Trust Kael**, confirm a visible focus ring, then press Enter.
-4. Confirm the world state remains **Elevated**, Kael is not arrested, and Mira's new
-   memory says she protected Kael.
-5. Open **Ravi**. Confirm his panel shows the earlier Ember failure but never says
-   that Kael removed a fragment to stop a larger reaction. Select **Continue as Ravi**.
-6. Confirm the scene is narrated as Ravi and any fallback indicator is understandable.
-7. Open **Time Machine**, create the **Expose Kael** alternate future, and confirm
-   Timeline B is violet/visually distinct, alert is **Critical**, and Kael is detained.
-8. Switch to Timeline A and verify its **Elevated / not arrested** state is unchanged;
-   switch back to Timeline B and verify its state remains **Critical / detained**.
-9. Use **Reset Demo** and confirm the landing/opening state returns.
-10. Repeat a decision with a double click or two quick keyboard activations; confirm
-    only one committed event/memory appears. At a 390px viewport, confirm there is no
-    horizontal overflow and both decision cards remain reachable.
-
-Record the observed URL and pass/fail notes in the final delivery. The Vitest suite
-under `src/ai` covers provider failure modes deterministically; this checklist covers
-the integrated user journey when a browser runner is not installed.
+1. Start `npm run dev` and open the displayed URL.
+2. Confirm the product home explains world creation, persistent characters, perspectives, author commands, visuals, and narration.
+3. Tab to **Create a world** and confirm a visible focus state.
+4. Create a world with an original brief; confirm it appears in the World Atlas and opens its reader.
+5. With a configured provider key, confirm Chapter 1 shows a title, prose, persistent cast, and image beats.
+6. Select a cast member and confirm the visible perspective label, prose, images, and narration source change together.
+7. Return to canonical view and confirm the canonical label/prose return.
+8. Apply an author command, generate the next chapter, and confirm the new chapter is saved in the chapter archive.
+9. Navigate to a previous chapter and confirm its saved images are reused rather than regenerated.
+10. Prepare narration, change its speed, restart it, and confirm controls remain keyboard reachable at a 390px viewport.
