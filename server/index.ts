@@ -21,8 +21,18 @@ function validInput(value: unknown): value is CreateWorldInput {
 }
 
 async function start(): Promise<void> {
-  const persistence = await createRuntimeStore();
-  const assetStore = createAssetStoreFromEnvironment();
+  const persistence = await createRuntimeStore().catch((error: unknown) => {
+    logError("persistence.initialization_failed", { errorCode: safeErrorCode(error) });
+    throw error;
+  });
+  const assetStore = (() => {
+    try {
+      return createAssetStoreFromEnvironment();
+    } catch (error) {
+      logError("asset_storage.initialization_failed", { errorCode: safeErrorCode(error) });
+      throw error;
+    }
+  })();
   const configuredAssetStore = (process.env.STORYVERSE_ASSET_STORAGE ?? "local").trim().toLowerCase();
   const assetBackend = configuredAssetStore === "databricks" || configuredAssetStore === "databricks-volume" ? "databricks-volume" : "local";
   // Preserve pre-existing local image/narration URLs during the rollout. The
@@ -96,6 +106,12 @@ async function start(): Promise<void> {
   };
   process.once("SIGINT", () => close("SIGINT"));
   process.once("SIGTERM", () => close("SIGTERM"));
+}
+
+function safeErrorCode(error: unknown): string {
+  if (!error || typeof error !== "object") return "unknown";
+  const code = (error as { code?: unknown }).code;
+  return typeof code === "string" && /^[A-Za-z0-9_.-]{1,64}$/.test(code) ? code : "unknown";
 }
 
 void start().catch(() => {

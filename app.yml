@@ -1,0 +1,47 @@
+command:
+  - npm
+  - run
+  - start
+
+env:
+  - name: OPENAI_API_KEY
+    valueFrom: openai_api_key
+
+  - name: STORYVERSE_MEDIA_VOLUME
+    valueFrom: media_volume
+
+  - name: STORYVERSE_SQLITE_PATH
+    value: /tmp/storyverse.db
+
+  - name: ENDPOINT_NAME
+    value: projects/ai-storyverse/branches/production/endpoints/primary
+
+  - name: STORYVERSE_PG_SCHEMA
+    value: storyverse_v2
+
+  - name: OPENAI_MODEL
+    value: gpt-5.6-luna
+
+  - name: OPENAI_IMAGE_MODEL
+    value: gpt-image-2
+
+  - name: OPENAI_NARRATION_MODEL
+    value: gpt-4o-mini-tts
+
+  - name: STORYVERSE_IMAGE_TIMEOUT_MS
+    value: "180000"
+
+  - name: STORYVERSE_NARRATION_TIMEOUT_MS
+    value: "120000"
+
+  - name: STORYVERSE_IMAGE_SIZE
+    value: 1024x1024
+
+  - name: STORYVERSE_IMAGE_QUALITY
+    value: medium
+
+  - name: STORYVERSE_ASSET_STORAGE
+    value: databricks-volume
+
+  - name: DATABRICKS_VOLUME_PATH
+    valueFrom: media_volume

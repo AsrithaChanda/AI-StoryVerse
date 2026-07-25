@@ -1,9 +1,10 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { DatabaseSync } from "node:sqlite";
 import type { NewStoryImage } from "../images/types.js";
 import type { WorldStory } from "../story.js";
 import { WorldStore } from "../worlds.js";
 import {
+  LakebaseDatabaseCredentialProvider,
   PostgresWorldStore,
   postgresConfigFromEnv,
   type PgClient,
@@ -157,6 +158,56 @@ describe("PostgresWorldStore configuration", () => {
       password: "short-lived-smoke-test-token",
       ssl: { rejectUnauthorized: true },
     });
+  });
+
+  it("generates and caches the Lakebase database password without exposing workspace credentials", async () => {
+    const workspaceTokenProvider = {
+      getAccessToken: vi.fn().mockResolvedValue("workspace-oauth-token"),
+    };
+    const fetcher = vi.fn<typeof fetch>().mockResolvedValue(new Response(JSON.stringify({
+      token: "lakebase-database-token",
+      expire_time: "2026-07-26T11:00:00.000Z",
+    }), { status: 200, headers: { "content-type": "application/json" } }));
+    const provider = new LakebaseDatabaseCredentialProvider({
+      host: "https://workspace.cloud.databricks.com",
+      endpoint: "projects/ai-storyverse/branches/production/endpoints/primary",
+      workspaceTokenProvider,
+      fetch: fetcher,
+      now: () => Date.parse("2026-07-26T10:00:00.000Z"),
+    });
+
+    await expect(Promise.all([provider.getPassword(), provider.getPassword()])).resolves.toEqual([
+      "lakebase-database-token",
+      "lakebase-database-token",
+    ]);
+    expect(workspaceTokenProvider.getAccessToken).toHaveBeenCalledTimes(1);
+    expect(fetcher).toHaveBeenCalledTimes(1);
+    expect(String(fetcher.mock.calls[0]?.[0])).toBe("https://workspace.cloud.databricks.com/api/2.0/postgres/credentials");
+    expect(fetcher.mock.calls[0]?.[1]).toMatchObject({
+      method: "POST",
+      body: JSON.stringify({ endpoint: "projects/ai-storyverse/branches/production/endpoints/primary" }),
+    });
+    const headers = new Headers(fetcher.mock.calls[0]?.[1]?.headers);
+    expect(headers.get("authorization")).toBe("Bearer workspace-oauth-token");
+  });
+
+  it("configures an isolated app schema for Lakebase connections", () => {
+    expect(postgresConfigFromEnv({
+      PGHOST: "ep-example.database.us-east-2.cloud.databricks.com",
+      PGDATABASE: "databricks_postgres",
+      PGUSER: "service-principal-id",
+      PGSSLMODE: "require",
+      ENDPOINT_NAME: "projects/ai-storyverse/branches/production/endpoints/primary",
+      STORYVERSE_PG_SCHEMA: "storyverse_v2",
+    })).toMatchObject({
+      options: "-c search_path=storyverse_v2",
+      ssl: { rejectUnauthorized: true },
+    });
+    expect(() => postgresConfigFromEnv({
+      PGHOST: "ep-example.database.us-east-2.cloud.databricks.com",
+      ENDPOINT_NAME: "projects/ai-storyverse/branches/production/endpoints/primary",
+      STORYVERSE_PG_SCHEMA: "public; DROP SCHEMA public",
+    })).toThrow(/STORYVERSE_PG_SCHEMA/);
   });
 });
 

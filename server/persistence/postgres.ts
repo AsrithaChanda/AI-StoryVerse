@@ -8,6 +8,12 @@ import type {
 } from "../worlds.js";
 import type { NewStoryImage, StoredStoryImage } from "../images/types.js";
 import type { StoryChapter, WorldStory } from "../story.js";
+import {
+  DatabricksOAuthM2MTokenProvider,
+  databricksOrigin,
+  type DatabricksAccessTokenProvider,
+  type DatabricksFetch,
+} from "../storage/databricks-volume-asset-store.js";
 import { POSTGRES_MIGRATIONS_TABLE, POSTGRES_SCHEMA_MIGRATIONS } from "./schema.js";
 import type {
   StoryImageReservation,
@@ -41,12 +47,13 @@ export type PostgresConnectionConfig = {
   port?: number;
   database?: string;
   user?: string;
-  password?: string;
+  password?: string | (() => string | Promise<string>);
   ssl?: { rejectUnauthorized: boolean };
   max?: number;
   idleTimeoutMillis?: number;
   connectionTimeoutMillis?: number;
   application_name?: string;
+  options?: string;
 };
 
 export type PostgresWorldStoreOptions = {
@@ -58,11 +65,99 @@ export type CreatePostgresWorldStoreOptions = PostgresWorldStoreOptions & {
   /** Tests and hosts with their own pool lifecycle may inject a pool directly. */
   pool?: PgPool;
   environment?: Record<string, string | undefined>;
+  fetch?: DatabricksFetch;
   /** Defaults to true so a returned store is ready for request traffic. */
   initialize?: boolean;
 };
 
 const MIGRATION_LOCK_KEY = 8_104_202_501;
+
+export type LakebaseDatabaseCredentialProviderOptions = {
+  host: string;
+  endpoint: string;
+  workspaceTokenProvider: DatabricksAccessTokenProvider;
+  fetch?: DatabricksFetch;
+  now?: () => number;
+  refreshSkewMs?: number;
+};
+
+/**
+ * Exchanges a workspace OAuth token for the short-lived credential Lakebase
+ * expects as the PostgreSQL password. node-postgres calls this provider when
+ * it opens a new pooled connection, while the cache avoids needless exchanges.
+ */
+export class LakebaseDatabaseCredentialProvider {
+  private readonly credentialUrl: URL;
+  private readonly endpoint: string;
+  private readonly workspaceTokenProvider: DatabricksAccessTokenProvider;
+  private readonly fetcher: DatabricksFetch;
+  private readonly now: () => number;
+  private readonly refreshSkewMs: number;
+  private cached: { value: string; expiresAt: number } | undefined;
+  private refreshing: Promise<string> | undefined;
+
+  public constructor(options: LakebaseDatabaseCredentialProviderOptions) {
+    this.credentialUrl = new URL("/api/2.0/postgres/credentials", databricksOrigin(options.host));
+    this.endpoint = lakebaseEndpointName(options.endpoint);
+    this.workspaceTokenProvider = options.workspaceTokenProvider;
+    this.fetcher = options.fetch ?? globalThis.fetch;
+    if (typeof this.fetcher !== "function") throw new Error("A fetch implementation is required for Lakebase authentication.");
+    this.now = options.now ?? Date.now;
+    this.refreshSkewMs = Math.max(15_000, options.refreshSkewMs ?? 60_000);
+  }
+
+  public async getPassword(): Promise<string> {
+    if (this.cached && this.cached.expiresAt > this.now()) return this.cached.value;
+    if (!this.refreshing) {
+      this.refreshing = this.requestCredential().finally(() => { this.refreshing = undefined; });
+    }
+    return this.refreshing;
+  }
+
+  private async requestCredential(): Promise<string> {
+    let response: Response;
+    try {
+      response = await this.fetcher(this.credentialUrl, {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${await this.workspaceTokenProvider.getAccessToken()}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({ endpoint: this.endpoint }),
+      });
+    } catch {
+      throw new Error("Lakebase database credential request failed.");
+    }
+    if (!response.ok) throw new Error(`Lakebase database credential request failed with status ${response.status}.`);
+
+    let body: unknown;
+    try {
+      body = await response.json();
+    } catch {
+      throw new Error("Lakebase database credential response was invalid.");
+    }
+    const payload = body as { token?: unknown; expire_time?: unknown };
+    const token = typeof payload.token === "string" ? payload.token : "";
+    const expireTime = typeof payload.expire_time === "string" ? Date.parse(payload.expire_time) : Number.NaN;
+    if (!token || token.length > 16_384 || /[\r\n\0]/.test(token)) {
+      throw new Error("Lakebase database credential response did not include a valid token.");
+    }
+    const serverExpiry = Number.isFinite(expireTime) ? expireTime : this.now() + 3_600_000;
+    this.cached = {
+      value: token,
+      expiresAt: Math.max(this.now() + 1_000, serverExpiry - this.refreshSkewMs),
+    };
+    return token;
+  }
+}
+
+function lakebaseEndpointName(value: string): string {
+  const endpoint = typeof value === "string" ? value.trim() : "";
+  if (!/^projects\/[A-Za-z0-9._-]+\/branches\/[A-Za-z0-9._-]+\/endpoints\/[A-Za-z0-9._-]+$/.test(endpoint)) {
+    throw new Error("ENDPOINT_NAME must be a valid Lakebase endpoint resource name.");
+  }
+  return endpoint;
+}
 
 type WorldRow = Record<string, unknown> & {
   id: string;
@@ -250,6 +345,7 @@ export function postgresConfigFromEnv(
   // a short-lived fallback for local smoke tests where the DSN has no password.
   const password = environment.PGPASSWORD
     ?? (passwordFromConnectionString(connectionString) ? undefined : environment.DATABRICKS_OAUTH_TOKEN);
+  const schema = environment.ENDPOINT_NAME?.trim() ? postgresSchemaFromEnv(environment) : undefined;
 
   return {
     ...(connectionString ? { connectionString, ...(password ? { password } : {}) } : {
@@ -264,7 +360,16 @@ export function postgresConfigFromEnv(
     idleTimeoutMillis,
     connectionTimeoutMillis,
     application_name: environment.PGAPPNAME?.trim() || "storyverse",
+    ...(schema ? { options: `-c search_path=${schema}` } : {}),
   };
+}
+
+function postgresSchemaFromEnv(environment: Record<string, string | undefined>): string {
+  const schema = environment.STORYVERSE_PG_SCHEMA?.trim() || "storyverse";
+  if (!/^[a-z][a-z0-9_]{0,62}$/.test(schema)) {
+    throw new Error("STORYVERSE_PG_SCHEMA must be a lowercase PostgreSQL identifier.");
+  }
+  return schema;
 }
 
 function numberEnv(value: string | undefined, fallback: number): number {
@@ -282,9 +387,28 @@ async function loadPgPoolConstructor(): Promise<new (config: PostgresConnectionC
 
 export async function createPostgresPoolFromEnv(
   environment: Record<string, string | undefined> = process.env,
+  fetcher?: DatabricksFetch,
 ): Promise<PgPool | null> {
   const config = postgresConfigFromEnv(environment);
   if (!config) return null;
+  if (!config.password && environment.ENDPOINT_NAME?.trim()) {
+    const host = environment.DATABRICKS_HOST ?? "";
+    const clientId = environment.DATABRICKS_CLIENT_ID ?? "";
+    const clientSecret = environment.DATABRICKS_CLIENT_SECRET ?? "";
+    const workspaceTokenProvider = new DatabricksOAuthM2MTokenProvider({
+      host,
+      clientId,
+      clientSecret,
+      fetch: fetcher,
+    });
+    const credentialProvider = new LakebaseDatabaseCredentialProvider({
+      host,
+      endpoint: environment.ENDPOINT_NAME,
+      workspaceTokenProvider,
+      fetch: fetcher,
+    });
+    config.password = () => credentialProvider.getPassword();
+  }
   const Pool = await loadPgPoolConstructor();
   return new Pool(config);
 }
@@ -296,8 +420,13 @@ export async function createPostgresPoolFromEnv(
 export async function createPostgresWorldStoreFromEnv(
   options: CreatePostgresWorldStoreOptions = {},
 ): Promise<PostgresWorldStore | null> {
-  const pool = options.pool ?? await createPostgresPoolFromEnv(options.environment);
+  const environment = options.environment ?? process.env;
+  const pool = options.pool ?? await createPostgresPoolFromEnv(environment, options.fetch);
   if (!pool) return null;
+  if (!options.pool && environment.ENDPOINT_NAME?.trim()) {
+    const schema = postgresSchemaFromEnv(environment);
+    await pool.query(`CREATE SCHEMA IF NOT EXISTS "${schema}" AUTHORIZATION CURRENT_USER`);
+  }
   const store = new PostgresWorldStore(pool, options);
   if (options.initialize !== false) await store.initialize();
   return store;
