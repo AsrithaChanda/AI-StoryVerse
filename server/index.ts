@@ -10,6 +10,7 @@ import { createStoryImagePipeline } from "./images/pipeline.js";
 import { apiRequestLogger, logError, logInfo, logWarn } from "./logger.js";
 import { createRuntimeStore } from "./runtime-store.js";
 import { createStoryRouter } from "./story-routes.js";
+import { createStoryTrailerRouter } from "./story-trailer-routes.js";
 import { createAssetStoreFromEnvironment } from "./storage/index.js";
 import { generateInitialStory } from "./story.js";
 import type { CreateWorldInput } from "./worlds.js";
@@ -81,6 +82,7 @@ async function start(): Promise<void> {
   app.use("/api", createImageRouter({ store: persistence.store, assets: imageAssets, pipeline: imagePipeline }));
   app.use("/api", createChapterAudioRouter(persistence.store, assetBackend === "databricks-volume" ? assetStore : undefined));
   app.use("/api", createStoryRouter(persistence.store));
+  app.use("/api", createStoryTrailerRouter({ store: persistence.store, assets: assetStore }));
 
   const builtApp = resolve(process.cwd(), "dist", "index.html");
   if (existsSync(builtApp)) {

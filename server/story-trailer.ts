@@ -97,7 +97,8 @@ export class OpenAIStoryTrailerProvider implements StoryTrailerProvider {
   private readonly fetcher: typeof globalThis.fetch;
 
   public constructor(options: OpenAIStoryTrailerProviderOptions = {}) {
-    this.apiKey = typeof options.apiKey === "string" ? options.apiKey.trim() : "";
+    const configuredApiKey = options.apiKey ?? process.env.OPENAI_API_KEY;
+    this.apiKey = typeof configuredApiKey === "string" ? configuredApiKey.trim() : "";
     this.model = safeModel(options.model ?? process.env.OPENAI_VIDEO_MODEL ?? "sora-2");
     this.seconds = options.seconds ?? configuredSeconds(process.env.STORYVERSE_TRAILER_SECONDS);
     this.size = options.size ?? configuredSize(process.env.STORYVERSE_TRAILER_SIZE);
@@ -234,8 +235,8 @@ export class StoryTrailerService {
         return toPublicStoryTrailer(trailer);
       }
       const requeued = await this.options.store.requeueFailedStoryTrailer(prepared.cacheKey);
-      if (!requeued || requeued.status !== "queued") return toPublicStoryTrailer(await this.latestTrailer(prepared, trailer));
-      trailer = requeued;
+      if (!requeued?.requeued) return toPublicStoryTrailer(requeued?.trailer ?? await this.latestTrailer(prepared, trailer));
+      trailer = requeued.trailer;
       logInfo("story_trailer.request.requeued", trailerLogFields(trailer));
     } else {
       logInfo("story_trailer.request.reserved", trailerLogFields(trailer));
@@ -255,9 +256,14 @@ export class StoryTrailerService {
     return toPublicStoryTrailer(trailer);
   }
 
-  /** Binary assets are retrieved only by a content-addressed filename. */
-  public async getAsset(filename: string): Promise<StoredAsset | null> {
+  /** Binary assets are retrieved only when the content-addressed file belongs
+   * to a ready trailer in the requested world. */
+  public async getAsset(worldId: string, filename: string): Promise<StoredAsset | null> {
     if (!videoFilename.test(filename)) return null;
+    const cacheKey = filename.slice(0, -".mp4".length).toLowerCase();
+    const trailer = await this.options.store.getStoryTrailerByCacheKey(cacheKey);
+    if (!trailer || trailer.worldId !== worldId || trailer.status !== "ready") return null;
+    if (trailer.videoUrl !== `/api/worlds/${worldId}/story/trailer/assets/${filename}`) return null;
     return this.options.assets.read(this.assetKey(filename));
   }
 

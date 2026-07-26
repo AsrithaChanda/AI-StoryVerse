@@ -28,11 +28,23 @@ env:
   - name: OPENAI_NARRATION_MODEL
     value: gpt-4o-mini-tts
 
+  - name: OPENAI_VIDEO_MODEL
+    value: sora-2
+
   - name: STORYVERSE_IMAGE_TIMEOUT_MS
     value: "180000"
 
   - name: STORYVERSE_NARRATION_TIMEOUT_MS
     value: "120000"
+
+  - name: STORYVERSE_TRAILER_TIMEOUT_MS
+    value: "120000"
+
+  - name: STORYVERSE_TRAILER_SECONDS
+    value: "8"
+
+  - name: STORYVERSE_TRAILER_SIZE
+    value: 1280x720
 
   - name: STORYVERSE_IMAGE_SIZE
     value: 1024x1024
