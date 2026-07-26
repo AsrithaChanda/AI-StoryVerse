@@ -504,12 +504,12 @@ export default function GeneratedWorldReader({ world, close }: { world: World; c
                 onPropose={proposeDirectorChange}
                 onApply={applyDirectorChange}
               />}
-              {isLatestChapter && isCanonicalReading && <StoryTrailer
+              {isCanonicalReading && <StoryTrailer
                 key={`${world.id}-${chapterArtifactKey}-${story.chapters.length}`}
                 worldId={world.id}
                 chapterId={chapter.id}
                 chapterRevision={chapter.revision ?? 1}
-                chapterCount={story.chapters.length}
+                chapterCount={chapterIndex + 1}
                 disabled={busy || Boolean(illustrationProgress)}
               />}
             </>}

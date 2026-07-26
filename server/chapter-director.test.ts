@@ -85,6 +85,8 @@ describe("chapter director", () => {
     expect(proposal?.proposedChapter.beats.map((beat) => beat.id)).toEqual(["chapter-7-r3-beat-1", "chapter-7-r3-beat-2", "chapter-7-r3-beat-3"]);
     const request = generate.mock.calls[0]?.[0] as ChapterDirectorModelRequest;
     expect(request.model).toBe("test-director-model");
+    expect(request.instructions).toContain("clear, natural Indian English");
+    expect(request.instructions).toContain("seven to ten small paragraphs");
     expect(request.responseSchema).toMatchObject({ type: "object", additionalProperties: false, required: ["directorIntent", "changes", "proposedChapter"] });
     expect((request.responseSchema as { properties: { proposedChapter: { properties: Record<string, unknown> } } }).properties.proposedChapter.properties).not.toHaveProperty("id");
   });

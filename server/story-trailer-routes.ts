@@ -1,5 +1,5 @@
 import { Router, type Request, type Response } from "express";
-import type { StoryStore } from "./persistence/store.js";
+import type { StoryStore, StoryTrailerKind } from "./persistence/store.js";
 import type { AssetStore, StoredAsset } from "./storage/index.js";
 import {
   StoryTrailerError,
@@ -44,6 +44,114 @@ export function createStoryTrailerRouter(options: StoryTrailerRouterOptions): Ro
     }
   });
 
+  router.get("/worlds/:worldId/story/chapters/:chapterId/trailer", async (request, response) => {
+    try {
+      return response.json({
+        trailer: await service.getForChapter(request.params.worldId, request.params.chapterId, "story_so_far"),
+      });
+    } catch (error) {
+      return storyTrailerErrorResponse(response, error);
+    }
+  });
+
+  router.post("/worlds/:worldId/story/chapters/:chapterId/trailer", async (request, response) => {
+    if (!validStartBody(request.body)) {
+      return response.status(400).json({
+        error: "The trailer request must be empty or contain only a boolean retry field.",
+        code: "invalid_request",
+      });
+    }
+    try {
+      const trailer = await service.startForChapter(
+        request.params.worldId,
+        request.params.chapterId,
+        "story_so_far",
+        request.body.retry === true,
+      );
+      const status = trailer.status === "queued" || trailer.status === "in_progress" ? 202 : 200;
+      return response.status(status).json({ trailer });
+    } catch (error) {
+      return storyTrailerErrorResponse(response, error);
+    }
+  });
+
+  router.post("/worlds/:worldId/story/chapters/:chapterId/trailer/remix", async (request, response) => {
+    if (!validRemixBody(request.body)) {
+      return response.status(400).json({
+        error: "Describe the video changes in 3 to 800 characters.",
+        code: "invalid_edit_prompt",
+      });
+    }
+    try {
+      const trailer = await service.remix(
+        request.params.worldId,
+        request.params.chapterId,
+        "story_so_far",
+        request.body.prompt,
+      );
+      return response.status(202).json({ trailer });
+    } catch (error) {
+      return storyTrailerErrorResponse(response, error);
+    }
+  });
+
+  router.get("/worlds/:worldId/story/chapters/:chapterId/trailers/:kind", async (request, response) => {
+    const kind = trailerKind(request.params.kind);
+    if (!kind) return response.status(404).json({ error: "Video type not found.", code: "trailer_kind_not_found" });
+    try {
+      return response.json({
+        trailer: await service.getForChapter(request.params.worldId, request.params.chapterId, kind),
+      });
+    } catch (error) {
+      return storyTrailerErrorResponse(response, error);
+    }
+  });
+
+  router.post("/worlds/:worldId/story/chapters/:chapterId/trailers/:kind", async (request, response) => {
+    const kind = trailerKind(request.params.kind);
+    if (!kind) return response.status(404).json({ error: "Video type not found.", code: "trailer_kind_not_found" });
+    if (!validStartBody(request.body)) {
+      return response.status(400).json({
+        error: "The video request must be empty or contain only a boolean retry field.",
+        code: "invalid_request",
+      });
+    }
+    try {
+      const trailer = await service.startForChapter(
+        request.params.worldId,
+        request.params.chapterId,
+        kind,
+        request.body.retry === true,
+      );
+      const status = trailer.status === "queued" || trailer.status === "in_progress" ? 202 : 200;
+      return response.status(status).json({ trailer });
+    } catch (error) {
+      return storyTrailerErrorResponse(response, error);
+    }
+  });
+
+  router.post("/worlds/:worldId/story/chapters/:chapterId/trailers/:kind/remix", async (request, response) => {
+    const kind = trailerKind(request.params.kind);
+    if (!kind) return response.status(404).json({ error: "Video type not found.", code: "trailer_kind_not_found" });
+    if (!validRemixBody(request.body)) {
+      return response.status(400).json({
+        error: "Describe the video changes in 3 to 800 characters.",
+        code: "invalid_edit_prompt",
+      });
+    }
+    try {
+      const trailer = await service.remix(
+        request.params.worldId,
+        request.params.chapterId,
+        kind,
+        request.body.prompt,
+      );
+      return response.status(202).json({ trailer });
+    } catch (error) {
+      return storyTrailerErrorResponse(response, error);
+    }
+  });
+
   router.get("/worlds/:worldId/story/trailer/assets/:filename", async (request, response) => {
     try {
       const asset = await service.getAsset(request.params.worldId, request.params.filename);
@@ -62,6 +170,20 @@ function validStartBody(value: unknown): value is { retry?: boolean } {
   if (typeof value !== "object" || Array.isArray(value)) return false;
   const entries = Object.entries(value);
   return entries.every(([key, item]) => key === "retry" && typeof item === "boolean");
+}
+
+function trailerKind(value: string): StoryTrailerKind | null {
+  return value === "chapter" || value === "story_so_far" ? value : null;
+}
+
+function validRemixBody(value: unknown): value is { prompt: string } {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const entries = Object.entries(value);
+  return entries.length === 1
+    && entries[0][0] === "prompt"
+    && typeof entries[0][1] === "string"
+    && entries[0][1].trim().length >= 3
+    && entries[0][1].trim().length <= 800;
 }
 
 function storyTrailerErrorResponse(response: Response, error: unknown): Response {

@@ -1,9 +1,11 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import {
+  editStoryTrailer,
   getStoryTrailer,
   isStoryTrailerRequestError,
   requestStoryTrailer,
   type PublicStoryTrailer,
+  type StoryTrailerKind,
 } from "../api/story-trailer";
 import "../styles/story-trailer.css";
 
@@ -12,19 +14,32 @@ export type StoryTrailerProps = {
   chapterId: string;
   chapterRevision: number;
   chapterCount: number;
-  /** Keeps the control visible but prevents a render while another story state owns the reader. */
   disabled?: boolean;
 };
 
 type TrailerError = { message: string; code?: string };
+type TrailerMap<T> = Partial<Record<StoryTrailerKind, T>>;
 
 const POLL_INTERVAL_MS = 10_000;
+const VIDEO_KINDS: StoryTrailerKind[] = ["chapter", "story_so_far"];
+const VIDEO_COPY: Record<StoryTrailerKind, { title: string; description: string; scope: string }> = {
+  chapter: {
+    title: "This chapter",
+    description: "A focused film of the events and emotion in this chapter only.",
+    scope: "CHAPTER VIDEO",
+  },
+  story_so_far: {
+    title: "Story so far",
+    description: "A film covering the important moments from Chapter 1 up to this chapter.",
+    scope: "STORY VIDEO",
+  },
+};
 
 function isAbortError(error: unknown): boolean {
   return typeof error === "object" && error !== null && "name" in error && error.name === "AbortError";
 }
 
-function isPending(trailer: PublicStoryTrailer | null): boolean {
+function isPending(trailer: PublicStoryTrailer | null | undefined): boolean {
   return trailer?.status === "queued" || trailer?.status === "in_progress";
 }
 
@@ -33,53 +48,42 @@ function isCurrentTrailer(
   worldId: string,
   chapterId: string,
   chapterRevision: number,
+  kind: StoryTrailerKind,
 ): trailer is PublicStoryTrailer {
   return Boolean(trailer
     && trailer.worldId === worldId
     && trailer.chapterId === chapterId
-    && trailer.chapterRevision === chapterRevision);
-}
-
-function clampedProgress(value: number | undefined): number | null {
-  if (value === undefined || !Number.isFinite(value)) return null;
-  return Math.min(100, Math.max(0, Math.round(value)));
-}
-
-function chapterRange(count: number): string {
-  if (count <= 1) return "CHAPTER 01";
-  return `CHAPTERS 01–${String(count).padStart(2, "0")}`;
+    && trailer.chapterRevision === chapterRevision
+    && trailer.kind === kind);
 }
 
 function friendlyFailure(code?: string): string {
   switch (code) {
     case "video_provider_unavailable":
     case "video_model_unavailable":
-      return "Video rendering is not available for this world right now. Enable a video-capable provider, then try again.";
+      return "Video generation is not available right now. Check the video provider and try again.";
     case "provider_policy":
     case "content_policy":
-      return "This trailer direction needs a more original, world-specific take. Adjust the world direction and try again.";
+      return "This video direction needs a more original approach. Change the direction and try again.";
     case "video_timed_out":
-      return "The render took longer than expected and did not finish. You can safely try another take.";
+      return "The video took longer than expected. You can safely try again.";
     default:
-      return "The video service could not finish this trailer. Your story is unchanged—try another take when ready.";
+      return "The video service could not finish this film. Your story is safe, and you can try again.";
   }
 }
 
 function friendlyRequestError(error: unknown): TrailerError {
   if (isStoryTrailerRequestError(error)) {
-    if (error.code === "video_provider_unavailable" || error.code === "video_model_unavailable") {
-      return { message: friendlyFailure(error.code), code: error.code };
-    }
     return { message: error.message || friendlyFailure(error.code), code: error.code };
   }
-  return { message: error instanceof Error && error.message ? error.message : "The trailer request could not be started." };
+  return { message: error instanceof Error && error.message ? error.message : "The video request could not be started." };
 }
 
-/**
- * An intentionally independent, non-blocking UI around an asynchronous video
- * render. Its polling uses the durable server record, so leaving the reader or
- * refreshing never abandons a completed trailer.
- */
+function progressValue(value: number | undefined): number {
+  if (value === undefined || !Number.isFinite(value)) return 0;
+  return Math.min(100, Math.max(0, Math.round(value)));
+}
+
 export default function StoryTrailer({
   worldId,
   chapterId,
@@ -87,187 +91,220 @@ export default function StoryTrailer({
   chapterCount,
   disabled = false,
 }: StoryTrailerProps) {
-  const [trailer, setTrailer] = useState<PublicStoryTrailer | null>(null);
-  const [checkedKey, setCheckedKey] = useState<string | null>(null);
-  const [startingKey, setStartingKey] = useState<string | null>(null);
-  const [requestError, setRequestError] = useState<{ key: string; error: TrailerError } | null>(null);
-  const requestVersion = useRef(0);
-  const currentKey = `${worldId}:${chapterId}:${chapterRevision}`;
-  const currentTrailer = useMemo(
-    () => isCurrentTrailer(trailer, worldId, chapterId, chapterRevision) ? trailer : null,
-    [chapterId, chapterRevision, trailer, worldId],
-  );
-  const checking = checkedKey !== currentKey;
-  const starting = startingKey === currentKey;
-  const currentRequestError = requestError?.key === currentKey ? requestError.error : null;
-  const rendering = starting || isPending(currentTrailer);
-  const progress = clampedProgress(currentTrailer?.progress);
+  const [trailers, setTrailers] = useState<TrailerMap<PublicStoryTrailer | null>>({});
+  const [checked, setChecked] = useState<TrailerMap<boolean>>({});
+  const [selected, setSelected] = useState<Record<StoryTrailerKind, boolean>>({
+    chapter: true,
+    story_so_far: false,
+  });
+  const [starting, setStarting] = useState<TrailerMap<boolean>>({});
+  const [errors, setErrors] = useState<TrailerMap<TrailerError>>({});
+  const [editKind, setEditKind] = useState<StoryTrailerKind | null>(null);
+  const [editPrompts, setEditPrompts] = useState<TrailerMap<string>>({});
+  const [editing, setEditing] = useState<TrailerMap<boolean>>({});
 
-  // Read once when the displayed final chapter changes. Bumping the version
-  // means an earlier world's request can never replace a later world's state.
   useEffect(() => {
     const controller = new AbortController();
-    const version = ++requestVersion.current;
-
-    void getStoryTrailer(worldId, { signal: controller.signal })
-      .then(({ trailer: next }) => {
-        if (controller.signal.aborted || requestVersion.current !== version) return;
-        setTrailer(isCurrentTrailer(next, worldId, chapterId, chapterRevision) ? next : null);
-      })
-      .catch((error: unknown) => {
-        if (controller.signal.aborted || isAbortError(error) || requestVersion.current !== version) return;
-        setRequestError({ key: currentKey, error: friendlyRequestError(error) });
-      })
-      .finally(() => {
-        if (!controller.signal.aborted && requestVersion.current === version) setCheckedKey(currentKey);
-      });
-
+    for (const kind of VIDEO_KINDS) {
+      void getStoryTrailer(worldId, chapterId, kind, { signal: controller.signal })
+        .then(({ trailer }) => {
+          if (controller.signal.aborted) return;
+          setTrailers((current) => ({
+            ...current,
+            [kind]: isCurrentTrailer(trailer, worldId, chapterId, chapterRevision, kind) ? trailer : null,
+          }));
+          setErrors((current) => ({ ...current, [kind]: undefined }));
+        })
+        .catch((error: unknown) => {
+          if (controller.signal.aborted || isAbortError(error)) return;
+          setErrors((current) => ({ ...current, [kind]: friendlyRequestError(error) }));
+        })
+        .finally(() => {
+          if (!controller.signal.aborted) setChecked((current) => ({ ...current, [kind]: true }));
+        });
+    }
     return () => controller.abort();
-  }, [chapterId, chapterRevision, currentKey, worldId]);
+  }, [chapterId, chapterRevision, worldId]);
 
-  // Jobs are owned by the server. A ten-second refresh is deliberate: Sora
-  // jobs often take minutes, and readers should not need to hold this page open
-  // or hammer the provider while they wait.
+  const pendingKinds = useMemo(
+    () => VIDEO_KINDS.filter((kind) => isPending(trailers[kind])),
+    [trailers],
+  );
+  const pendingIdentity = pendingKinds.map((kind) => `${kind}:${trailers[kind]?.id ?? ""}:${trailers[kind]?.status}`).join("|");
+
   useEffect(() => {
-    if (!currentTrailer || !isPending(currentTrailer)) return;
+    if (!pendingIdentity) return;
+    const kindsToPoll = pendingIdentity
+      .split("|")
+      .map((identity) => identity.split(":")[0])
+      .filter((kind): kind is StoryTrailerKind => kind === "chapter" || kind === "story_so_far");
     const controller = new AbortController();
     let timer: number | undefined;
     let disposed = false;
-    const expectedTrailerId = currentTrailer.id;
-
     const refresh = async () => {
-      try {
-        const { trailer: next } = await getStoryTrailer(worldId, { signal: controller.signal });
-        if (disposed || controller.signal.aborted) return;
-        if (!isCurrentTrailer(next, worldId, chapterId, chapterRevision)) {
-          setTrailer(null);
-          return;
+      await Promise.all(kindsToPoll.map(async (kind) => {
+        try {
+          const { trailer } = await getStoryTrailer(worldId, chapterId, kind, { signal: controller.signal });
+          if (disposed || controller.signal.aborted) return;
+          if (!isCurrentTrailer(trailer, worldId, chapterId, chapterRevision, kind)) return;
+          setTrailers((current) => ({ ...current, [kind]: trailer }));
+          setErrors((current) => ({ ...current, [kind]: undefined }));
+        } catch (error) {
+          if (disposed || controller.signal.aborted || isAbortError(error)) return;
+          setErrors((current) => ({
+            ...current,
+            [kind]: { message: "We could not check this video just now. We will try again automatically." },
+          }));
         }
-        if (expectedTrailerId && next.id && next.id !== expectedTrailerId) return;
-        setTrailer(next);
-        setRequestError(null);
-      } catch (error) {
-        if (disposed || controller.signal.aborted || isAbortError(error)) return;
-        // Keep the durable queued record visible; a temporary cache/network
-        // miss should never look like a failed provider render.
-        setRequestError({
-          key: currentKey,
-          error: { message: "We could not check the render just now. We’ll keep trying automatically." },
-        });
-      } finally {
-        if (!disposed && !controller.signal.aborted) timer = window.setTimeout(() => void refresh(), POLL_INTERVAL_MS);
-      }
+      }));
+      if (!disposed && !controller.signal.aborted) timer = window.setTimeout(() => void refresh(), POLL_INTERVAL_MS);
     };
-
     timer = window.setTimeout(() => void refresh(), POLL_INTERVAL_MS);
     return () => {
       disposed = true;
       controller.abort();
       if (timer !== undefined) window.clearTimeout(timer);
     };
-  }, [chapterId, chapterRevision, currentKey, currentTrailer, worldId]);
+  }, [chapterId, chapterRevision, pendingIdentity, worldId]);
 
-  const startTrailer = async (retry = false) => {
-    if (disabled || starting) return;
-    const version = ++requestVersion.current;
-    setStartingKey(currentKey);
-    setRequestError(null);
+  const startOne = async (kind: StoryTrailerKind, retry = false) => {
+    if (disabled || starting[kind]) return;
+    setStarting((current) => ({ ...current, [kind]: true }));
+    setErrors((current) => ({ ...current, [kind]: undefined }));
     try {
-      const { trailer: next } = await requestStoryTrailer(worldId, { retry });
-      if (requestVersion.current !== version) return;
-      if (!isCurrentTrailer(next, worldId, chapterId, chapterRevision)) {
-        throw new Error("The trailer request did not match the chapter currently on screen.");
+      const { trailer } = await requestStoryTrailer(worldId, chapterId, kind, { retry });
+      if (!isCurrentTrailer(trailer, worldId, chapterId, chapterRevision, kind)) {
+        throw new Error("The video did not match the chapter currently on screen.");
       }
-      setTrailer(next);
+      setTrailers((current) => ({ ...current, [kind]: trailer }));
     } catch (error) {
-      if (requestVersion.current === version) setRequestError({ key: currentKey, error: friendlyRequestError(error) });
+      setErrors((current) => ({ ...current, [kind]: friendlyRequestError(error) }));
     } finally {
-      if (requestVersion.current === version) {
-        setCheckedKey(currentKey);
-        setStartingKey((key) => key === currentKey ? null : key);
-      }
+      setStarting((current) => ({ ...current, [kind]: false }));
+      setChecked((current) => ({ ...current, [kind]: true }));
     }
   };
 
-  const failure = currentTrailer?.status === "failed"
-    ? { message: friendlyFailure(currentTrailer.errorCode), code: currentTrailer.errorCode }
-    : currentRequestError;
-  const statusLabel = starting
-    ? "Preparing a trailer request"
-    : currentTrailer?.status === "queued"
-      ? "Trailer request queued"
-      : currentTrailer?.status === "in_progress"
-        ? "Rendering your trailer"
-        : "";
+  const generateSelected = async () => {
+    const kinds = VIDEO_KINDS.filter((kind) => selected[kind]);
+    await Promise.all(kinds.map((kind) => startOne(kind)));
+  };
 
-  return <section className="story-trailer" aria-labelledby="story-trailer-heading" aria-busy={rendering}>
+  const editOne = async (kind: StoryTrailerKind) => {
+    const prompt = (editPrompts[kind] ?? "").replace(/\s+/g, " ").trim();
+    if (disabled || editing[kind] || prompt.length < 3 || prompt.length > 800) return;
+    setEditing((current) => ({ ...current, [kind]: true }));
+    setErrors((current) => ({ ...current, [kind]: undefined }));
+    try {
+      const { trailer } = await editStoryTrailer(worldId, chapterId, kind, prompt);
+      if (!isCurrentTrailer(trailer, worldId, chapterId, chapterRevision, kind)) {
+        throw new Error("The edited video did not match the chapter currently on screen.");
+      }
+      setTrailers((current) => ({ ...current, [kind]: trailer }));
+      setEditKind(null);
+    } catch (error) {
+      setErrors((current) => ({ ...current, [kind]: friendlyRequestError(error) }));
+    } finally {
+      setEditing((current) => ({ ...current, [kind]: false }));
+    }
+  };
+
+  const selectedCount = VIDEO_KINDS.filter((kind) => selected[kind]).length;
+  const anyStarting = VIDEO_KINDS.some((kind) => starting[kind]);
+
+  return <section className="story-trailer" aria-labelledby="story-trailer-heading">
     <header className="story-trailer__header">
       <div>
-        <p className="story-trailer__eyebrow"><span aria-hidden="true" /> STORY TRAILER</p>
-        <h2 id="story-trailer-heading">A glimpse of the <em>world so far.</em></h2>
+        <p className="story-trailer__eyebrow"><span aria-hidden="true" /> STORY FILMS</p>
+        <h2 id="story-trailer-heading">Choose what you want to <em>watch.</em></h2>
       </div>
-      <p className="story-trailer__scope">{chapterRange(chapterCount)}</p>
+      <p className="story-trailer__scope">12 SECONDS EACH</p>
     </header>
 
-    {currentTrailer?.status === "ready" && currentTrailer.videoUrl
-      ? <div className="story-trailer__ready">
-        <video
-          className="story-trailer__video"
-          controls
-          playsInline
-          preload="metadata"
-          src={currentTrailer.videoUrl}
-          aria-label={`Story trailer through chapter ${chapterCount}`}
-        >
-          Your browser cannot play this story trailer.
-        </video>
-        <div className="story-trailer__ready-footer">
-          <p><span aria-hidden="true">✦</span> A cinematic glimpse through Chapter {chapterCount}.</p>
-          <small>SAVED TO THIS WORLD</small>
-        </div>
+    <div className="story-trailer__selector">
+      <p>Select one or both. Each option creates and saves a separate 12-second video.</p>
+      <div>
+        {VIDEO_KINDS.map((kind) => <label key={kind}>
+          <input
+            type="checkbox"
+            checked={selected[kind]}
+            onChange={(event) => setSelected((current) => ({ ...current, [kind]: event.target.checked }))}
+          />
+          <span><b>{VIDEO_COPY[kind].title}</b><small>{VIDEO_COPY[kind].description}</small></span>
+        </label>)}
       </div>
-      : rendering
-        ? <div className="story-trailer__rendering" role="status" aria-live="polite">
-          <div className="story-trailer__rendering-mark" aria-hidden="true"><i /><i /><i /></div>
-          <div className="story-trailer__rendering-copy">
-            <p>{statusLabel}</p>
-            <b>{currentTrailer?.status === "queued" ? "Your story is in the render queue." : "We’re composing a cinematic glimpse from your world."}</b>
-            <small>You can keep reading—this can take a few minutes.</small>
-          </div>
-          <div
-            className={`story-trailer__progress${progress === null ? " story-trailer__progress--indeterminate" : ""}`}
-            role="progressbar"
-            aria-label="Story trailer rendering progress"
-            aria-valuemin={0}
-            aria-valuemax={100}
-            aria-valuenow={progress ?? undefined}
-          >
-            <i style={progress === null ? undefined : { width: `${progress}%` }} />
-          </div>
-          <p className="story-trailer__progress-label">{progress === null ? "Render status will update here." : `${progress}% rendered`}</p>
-          {currentRequestError && <p className="story-trailer__check-note">{currentRequestError.message}</p>}
-        </div>
-        : failure
-          ? <div className="story-trailer__failure" role="alert">
-            <span className="story-trailer__failure-mark" aria-hidden="true">!</span>
-            <div>
-              <p>THE TRAILER NEEDS ANOTHER TAKE</p>
-              <b>{failure.message}</b>
-            </div>
-            <button type="button" onClick={() => void startTrailer(true)} disabled={disabled || checking}>
-              Try again <span aria-hidden="true">→</span>
-            </button>
-          </div>
-          : <div className="story-trailer__idle">
-            <div>
-              <p className="story-trailer__idle-label">ON-DEMAND CINEMATIC RECAP</p>
-              <p>Generate an approximately eight-second, original-world trailer shaped by the turning points from Chapters 1–{chapterCount}.</p>
-              {checking && <small role="status" aria-live="polite">Checking for a saved trailer…</small>}
-              {disabled && <small>Return to the canonical final chapter to create a trailer.</small>}
-            </div>
-            <button type="button" onClick={() => void startTrailer()} disabled={disabled || starting}>
-              Generate story trailer <span aria-hidden="true">→</span>
-            </button>
-          </div>}
+      <button
+        type="button"
+        onClick={() => void generateSelected()}
+        disabled={disabled || anyStarting || selectedCount === 0}
+      >
+        {anyStarting ? "Starting selected videos…" : `Generate selected ${selectedCount === 1 ? "video" : "videos"}`}
+      </button>
+    </div>
+
+    <div className="story-trailer__options">
+      {VIDEO_KINDS.map((kind) => {
+        const trailer = trailers[kind];
+        const error = errors[kind];
+        const pending = starting[kind] || editing[kind] || isPending(trailer);
+        const progress = progressValue(trailer?.progress);
+        const prompt = editPrompts[kind] ?? "";
+        return <article className="story-trailer__option" key={kind} aria-busy={pending}>
+          <header>
+            <div><span>{VIDEO_COPY[kind].scope}</span><h3>{VIDEO_COPY[kind].title}</h3></div>
+            <small>{kind === "chapter" ? `CHAPTER ${chapterCount}` : `CHAPTERS 1–${chapterCount}`}</small>
+          </header>
+
+          {trailer?.status === "ready" && trailer.videoUrl
+            ? <>
+              <video controls playsInline preload="metadata" src={trailer.videoUrl}>
+                Your browser cannot play this video.
+              </video>
+              <footer>
+                <span>SAVED TO THIS CHAPTER</span>
+                <button type="button" onClick={() => setEditKind((current) => current === kind ? null : kind)} disabled={disabled}>
+                  {editKind === kind ? "Cancel edit" : "Edit with prompt"}
+                </button>
+              </footer>
+            </>
+            : pending
+              ? <div className="story-trailer__option-progress" role="status">
+                <b>{starting[kind] || editing[kind] ? "Preparing the request…" : "Generating your video…"}</b>
+                <p>You can continue reading. The video will remain saved when it is ready.</p>
+                <i><em style={{ width: `${progress}%` }} /></i>
+                <small>{progress > 0 ? `${progress}% complete` : "Waiting for progress"}</small>
+              </div>
+              : trailer?.status === "failed"
+                ? <div className="story-trailer__option-error" role="alert">
+                  <p>{friendlyFailure(trailer.errorCode)}</p>
+                  <button type="button" onClick={() => void startOne(kind, true)} disabled={disabled}>Try again</button>
+                </div>
+                : <div className="story-trailer__option-empty">
+                  <p>{checked[kind] ? "No saved video for this version of the chapter." : "Checking for a saved video…"}</p>
+                </div>}
+
+          {editKind === kind && trailer?.status === "ready" && <form onSubmit={(event) => {
+            event.preventDefault();
+            void editOne(kind);
+          }}>
+            <label htmlFor={`video-edit-${chapterId}-${kind}`}>Describe the changes</label>
+            <textarea
+              id={`video-edit-${chapterId}-${kind}`}
+              value={prompt}
+              onChange={(event) => setEditPrompts((current) => ({ ...current, [kind]: event.target.value }))}
+              minLength={3}
+              maxLength={800}
+              rows={3}
+              placeholder="For example: Make the ending more tense, with slower camera movement and softer music."
+              required
+            />
+            {error && <p className="story-trailer__edit-error" role="alert">{error.message}</p>}
+            <button type="submit" disabled={disabled || editing[kind] || prompt.trim().length < 3}>Generate edited video</button>
+            <small>The current video stays saved. The edited video becomes the latest version when ready.</small>
+          </form>}
+          {error && editKind !== kind && trailer?.status !== "failed" && <p className="story-trailer__option-note" role="alert">{error.message}</p>}
+        </article>;
+      })}
+    </div>
   </section>;
 }

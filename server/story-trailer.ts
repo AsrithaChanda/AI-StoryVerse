@@ -4,6 +4,7 @@ import {
   toPublicStoryTrailer,
   type PublicStoryTrailer,
   type StoredStoryTrailer,
+  type StoryTrailerKind,
   type StoryStore,
 } from "./persistence/store.js";
 import type { AssetStore, StoredAsset } from "./storage/index.js";
@@ -11,7 +12,7 @@ import type { StoryChapter, WorldStory } from "./story.js";
 import type { World } from "./worlds.js";
 
 /** Bump when the trailer prompt contract changes so old renders are never reused. */
-export const STORY_TRAILER_PROMPT_VERSION = "storyverse-trailer-v1";
+export const STORY_TRAILER_PROMPT_VERSION = "storyverse-trailer-v2";
 
 const OPENAI_VIDEO_URL = "https://api.openai.com/v1/videos";
 const videoFilename = /^[a-f0-9]{64}\.mp4$/i;
@@ -48,13 +49,17 @@ export interface StoryTrailerProvider {
   readonly name: string;
   readonly isAvailable: boolean;
   create(input: StoryTrailerGenerationInput): Promise<StoryTrailerProviderJob>;
+  remix(videoId: string, prompt: string): Promise<StoryTrailerProviderJob>;
   retrieve(jobId: string): Promise<StoryTrailerProviderJob>;
   download(jobId: string): Promise<GeneratedStoryTrailer>;
 }
 
 export type StoryTrailerErrorCode =
   | "world_not_found"
+  | "chapter_not_found"
   | "story_not_generated"
+  | "trailer_not_ready"
+  | "invalid_edit_prompt"
   | "provider_disabled"
   | "provider_error"
   | "timeout"
@@ -118,6 +123,16 @@ export class OpenAIStoryTrailerProvider implements StoryTrailerProvider {
     return parseVideoJob(await responseJson(response));
   }
 
+  public async remix(videoId: string, prompt: string): Promise<StoryTrailerProviderJob> {
+    this.assertAvailable();
+    const response = await this.request(`${OPENAI_VIDEO_URL}/${encodedJobId(videoId)}/remix`, {
+      method: "POST",
+      body: JSON.stringify({ prompt }),
+      headers: { "Content-Type": "application/json" },
+    });
+    return parseVideoJob(await responseJson(response));
+  }
+
   public async retrieve(jobId: string): Promise<StoryTrailerProviderJob> {
     this.assertAvailable();
     const response = await this.request(`${OPENAI_VIDEO_URL}/${encodedJobId(jobId)}`, { method: "GET" });
@@ -154,7 +169,7 @@ export class OpenAIStoryTrailerProvider implements StoryTrailerProvider {
     try {
       response = await this.fetcher(url, {
         ...init,
-        headers: { Authorization: `Bearer ${this.apiKey}` },
+        headers: { ...init.headers, Authorization: `Bearer ${this.apiKey}` },
         signal: AbortSignal.timeout(this.timeoutMs),
       });
     } catch (error) {
@@ -176,6 +191,7 @@ export class DisabledStoryTrailerProvider implements StoryTrailerProvider {
   public readonly isAvailable = false;
 
   public async create(): Promise<StoryTrailerProviderJob> { return this.unavailable(); }
+  public async remix(): Promise<StoryTrailerProviderJob> { return this.unavailable(); }
   public async retrieve(): Promise<StoryTrailerProviderJob> { return this.unavailable(); }
   public async download(): Promise<GeneratedStoryTrailer> { return this.unavailable(); }
 
@@ -199,6 +215,7 @@ type PreparedTrailer = {
   story: WorldStory;
   chapter: StoryChapter;
   chapterRevision: number;
+  kind: StoryTrailerKind;
   cacheKey: string;
   prompt: string;
 };
@@ -217,13 +234,48 @@ export class StoryTrailerService {
     this.provider = options.provider ?? createStoryTrailerProviderFromEnvironment();
   }
 
+  /** Backward-compatible latest-chapter entry point. */
   public async start(worldId: string, retry = false): Promise<PublicStoryTrailer> {
-    const prepared = await this.prepare(worldId);
+    return this.startPrepared(await this.prepare(worldId, undefined, "story_so_far"), retry);
+  }
+
+  public async startForChapter(
+    worldId: string,
+    chapterId: string,
+    kind: StoryTrailerKind,
+    retry = false,
+  ): Promise<PublicStoryTrailer> {
+    return this.startPrepared(await this.prepare(worldId, chapterId, kind), retry);
+  }
+
+  private async startPrepared(prepared: PreparedTrailer, retry: boolean): Promise<PublicStoryTrailer> {
+    const current = await this.options.store.findStoryTrailer(
+      prepared.world.id,
+      prepared.chapter.id,
+      prepared.chapterRevision,
+      prepared.kind,
+    );
+    if (current) {
+      if (current.status !== "failed" || !retry) {
+        logInfo("story_trailer.request.reused", trailerLogFields(current));
+        return toPublicStoryTrailer(current);
+      }
+      const requeued = await this.options.store.requeueFailedStoryTrailer(current.cacheKey);
+      if (!requeued?.requeued) return toPublicStoryTrailer(requeued?.trailer ?? current);
+      const retryPreparation = { ...prepared, cacheKey: current.cacheKey, prompt: current.prompt };
+      return this.launch(retryPreparation, requeued.trailer, () => this.provider.create({
+        prompt: current.prompt,
+        seconds: configuredSeconds(process.env.STORYVERSE_TRAILER_SECONDS),
+        size: configuredSize(process.env.STORYVERSE_TRAILER_SIZE),
+      }));
+    }
+
     const reservation = await this.options.store.reserveStoryTrailer({
       cacheKey: prepared.cacheKey,
       worldId: prepared.world.id,
       chapterId: prepared.chapter.id,
       chapterRevision: prepared.chapterRevision,
+      kind: prepared.kind,
       promptVersion: STORY_TRAILER_PROMPT_VERSION,
       prompt: prepared.prompt,
     });
@@ -234,7 +286,7 @@ export class StoryTrailerService {
         logInfo("story_trailer.request.reused", trailerLogFields(trailer));
         return toPublicStoryTrailer(trailer);
       }
-      const requeued = await this.options.store.requeueFailedStoryTrailer(prepared.cacheKey);
+      const requeued = await this.options.store.requeueFailedStoryTrailer(trailer.cacheKey);
       if (!requeued?.requeued) return toPublicStoryTrailer(requeued?.trailer ?? await this.latestTrailer(prepared, trailer));
       trailer = requeued.trailer;
       logInfo("story_trailer.request.requeued", trailerLogFields(trailer));
@@ -242,18 +294,85 @@ export class StoryTrailerService {
       logInfo("story_trailer.request.reserved", trailerLogFields(trailer));
     }
 
-    return this.launch(prepared, trailer);
+    return this.launch(prepared, trailer, () => this.provider.create({
+      prompt: prepared.prompt,
+      seconds: configuredSeconds(process.env.STORYVERSE_TRAILER_SECONDS),
+      size: configuredSize(process.env.STORYVERSE_TRAILER_SIZE),
+    }));
   }
 
-  /** Returns the current canonical chapter's record and polls only pending work. */
+  /** Returns the latest canonical chapter's record for older API clients. */
   public async get(worldId: string): Promise<PublicStoryTrailer | null> {
-    const prepared = await this.prepare(worldId);
-    const trailer = await this.options.store.getStoryTrailerByCacheKey(prepared.cacheKey);
+    const prepared = await this.prepare(worldId, undefined, "story_so_far");
+    return this.getPrepared(prepared);
+  }
+
+  /** Returns the newest render or remix for one exact canonical chapter. */
+  public async getForChapter(
+    worldId: string,
+    chapterId: string,
+    kind: StoryTrailerKind,
+  ): Promise<PublicStoryTrailer | null> {
+    const prepared = await this.prepare(worldId, chapterId, kind);
+    return this.getPrepared(prepared);
+  }
+
+  private async getPrepared(prepared: PreparedTrailer): Promise<PublicStoryTrailer | null> {
+    const trailer = await this.options.store.findStoryTrailer(
+      prepared.world.id,
+      prepared.chapter.id,
+      prepared.chapterRevision,
+      prepared.kind,
+    );
     if (!trailer) return null;
+    const storedPreparation = { ...prepared, cacheKey: trailer.cacheKey, prompt: trailer.prompt };
     if (trailer.status === "queued" || trailer.status === "in_progress") {
-      return toPublicStoryTrailer(await this.refresh(prepared, trailer));
+      return toPublicStoryTrailer(await this.refresh(storedPreparation, trailer));
     }
     return toPublicStoryTrailer(trailer);
+  }
+
+  /** Starts an OpenAI video remix while retaining the previous ready MP4. */
+  public async remix(
+    worldId: string,
+    chapterId: string,
+    kind: StoryTrailerKind,
+    editPrompt: string,
+  ): Promise<PublicStoryTrailer> {
+    const prepared = await this.prepare(worldId, chapterId, kind);
+    const edit = normalizedEditPrompt(editPrompt);
+    const source = await this.options.store.findReadyStoryTrailer(
+      prepared.world.id,
+      prepared.chapter.id,
+      prepared.chapterRevision,
+      prepared.kind,
+    );
+    const sourceVideoId = source?.providerAssetId ?? source?.providerJobId;
+    if (!source || !sourceVideoId) {
+      throw new StoryTrailerError("trailer_not_ready", "Generate and finish this chapter's trailer before editing it.", 409);
+    }
+
+    const prompt = buildStoryTrailerRemixPrompt(prepared.world, prepared.story, prepared.prompt, edit);
+    const cacheKey = remixCacheKey(source.cacheKey, prompt);
+    const edited = { ...prepared, cacheKey, prompt };
+    const reservation = await this.options.store.reserveStoryTrailer({
+      cacheKey,
+      worldId: prepared.world.id,
+      chapterId: prepared.chapter.id,
+      chapterRevision: prepared.chapterRevision,
+      kind: prepared.kind,
+      promptVersion: `${STORY_TRAILER_PROMPT_VERSION}-remix-v1`,
+      prompt,
+    });
+    let trailer = reservation.trailer;
+    if (!reservation.created) {
+      if (trailer.status !== "failed") return toPublicStoryTrailer(trailer);
+      const requeued = await this.options.store.requeueFailedStoryTrailer(cacheKey);
+      if (!requeued?.requeued) return toPublicStoryTrailer(requeued?.trailer ?? trailer);
+      trailer = requeued.trailer;
+    }
+    logInfo("story_trailer.remix.requested", trailerLogFields(trailer));
+    return this.launch(edited, trailer, () => this.provider.remix(sourceVideoId, prompt));
   }
 
   /** Binary assets are retrieved only when the content-addressed file belongs
@@ -267,17 +386,17 @@ export class StoryTrailerService {
     return this.options.assets.read(this.assetKey(filename));
   }
 
-  private async launch(prepared: PreparedTrailer, trailer: StoredStoryTrailer): Promise<PublicStoryTrailer> {
+  private async launch(
+    prepared: PreparedTrailer,
+    trailer: StoredStoryTrailer,
+    createJob: () => Promise<StoryTrailerProviderJob>,
+  ): Promise<PublicStoryTrailer> {
     if (!this.provider.isAvailable) {
       await this.persistFailure(prepared.cacheKey, "provider_disabled", prepared, trailer);
       throw new StoryTrailerError("provider_disabled", "Video generation is not configured. Add a video-capable OpenAI key and try again.", 503);
     }
     try {
-      const job = await this.provider.create({
-        prompt: prepared.prompt,
-        seconds: configuredSeconds(process.env.STORYVERSE_TRAILER_SECONDS),
-        size: configuredSize(process.env.STORYVERSE_TRAILER_SIZE),
-      });
+      const job = await createJob();
       if (job.status === "failed") {
         await this.persistFailure(prepared.cacheKey, normalizeProviderErrorCode(job.errorCode), prepared, trailer);
         throw new StoryTrailerError("provider_error", "The video provider could not start this trailer. Please try again.", 502);
@@ -350,22 +469,37 @@ export class StoryTrailerService {
     return (await this.options.store.getStoryTrailerByCacheKey(prepared.cacheKey)) ?? fallback;
   }
 
-  private async prepare(worldId: string): Promise<PreparedTrailer> {
+  private async prepare(
+    worldId: string,
+    chapterId: string | undefined,
+    kind: StoryTrailerKind,
+  ): Promise<PreparedTrailer> {
     const [world, story] = await Promise.all([
       this.options.store.get(worldId),
       this.options.store.getWorldStory(worldId),
     ]);
     if (!world) throw new StoryTrailerError("world_not_found", "World not found.", 404);
-    const chapter = story?.chapters.at(-1);
-    if (!story || !chapter) throw new StoryTrailerError("story_not_generated", "Generate Chapter 1 before creating a story trailer.", 409);
+    if (!story || story.chapters.length === 0) {
+      throw new StoryTrailerError("story_not_generated", "Generate Chapter 1 before creating a story trailer.", 409);
+    }
+    const chapterIndex = chapterId
+      ? story.chapters.findIndex((candidate) => candidate.id === chapterId)
+      : story.chapters.length - 1;
+    if (chapterIndex < 0) throw new StoryTrailerError("chapter_not_found", "Story chapter not found.", 404);
+    const chapter = story.chapters[chapterIndex];
+    const chapters = kind === "chapter"
+      ? [chapter]
+      : story.chapters.slice(0, chapterIndex + 1);
+    const storyForTrailer = { ...story, chapters };
     const chapterRevision = normalizedRevision(chapter.revision);
     return {
       world,
-      story,
+      story: storyForTrailer,
       chapter,
       chapterRevision,
-      cacheKey: storyTrailerCacheKey(world, story, chapter),
-      prompt: buildStoryTrailerPrompt(world, story, chapter),
+      kind,
+      cacheKey: storyTrailerCacheKey(world, storyForTrailer, chapter, kind),
+      prompt: buildStoryTrailerPrompt(world, storyForTrailer, chapter, kind),
     };
   }
 
@@ -375,9 +509,15 @@ export class StoryTrailerService {
 }
 
 /** Cache identity covers the full canonical history, not merely the current ID. */
-export function storyTrailerCacheKey(world: World, story: WorldStory, latestChapter: StoryChapter): string {
+export function storyTrailerCacheKey(
+  world: World,
+  story: WorldStory,
+  latestChapter: StoryChapter,
+  kind: StoryTrailerKind = "story_so_far",
+): string {
   const narrativeIdentity = {
     version: STORY_TRAILER_PROMPT_VERSION,
+    kind,
     worldId: world.id,
     world: {
       premise: world.premise,
@@ -385,7 +525,6 @@ export function storyTrailerCacheKey(world: World, story: WorldStory, latestChap
       creatorPrompt: world.creatorPrompt,
       openingScene: world.openingScene,
     },
-    worldState: story.worldState,
     latest: {
       id: latestChapter.id,
       number: latestChapter.number,
@@ -404,13 +543,48 @@ export function storyTrailerCacheKey(world: World, story: WorldStory, latestChap
   return createHash("sha256").update(JSON.stringify(narrativeIdentity)).digest("hex");
 }
 
+function remixCacheKey(sourceCacheKey: string, prompt: string): string {
+  return createHash("sha256").update(JSON.stringify({
+    version: `${STORY_TRAILER_PROMPT_VERSION}-remix-v1`,
+    sourceCacheKey,
+    prompt,
+  })).digest("hex");
+}
+
+export function buildStoryTrailerRemixPrompt(
+  world: World,
+  story: WorldStory,
+  basePrompt: string,
+  editPrompt: string,
+): string {
+  const identities = [
+    world.title,
+    ...world.characters.map((character) => character.name),
+    ...story.characters.map((character) => character.name),
+  ];
+  const edit = sanitizeEditText(normalizedEditPrompt(editPrompt), identities, 800);
+  return [
+    basePrompt,
+    "",
+    "Remix direction from the creator:",
+    edit,
+    "Apply the requested changes while preserving the same original story continuity, characters, setting, cinematic quality, synced audio, duration, aspect ratio, and final narrative meaning.",
+    "The remix must remain entirely original and must still contain no readable text, logos, famous people, protected characters, copyrighted music, lyrics, or imitation of a named artist, film, game, studio, or franchise.",
+  ].join("\n");
+}
+
 /**
  * Builds a bounded prompt from persisted canonical facts. It intentionally
  * avoids the user-supplied title and character names, then strips known names
  * from supporting prose, so an evocative title cannot turn into franchise
  * imitation in the video request.
  */
-export function buildStoryTrailerPrompt(world: World, story: WorldStory, latestChapter: StoryChapter): string {
+export function buildStoryTrailerPrompt(
+  world: World,
+  story: WorldStory,
+  latestChapter: StoryChapter,
+  kind: StoryTrailerKind = "story_so_far",
+): string {
   const identities = [
     world.title,
     ...world.characters.map((character) => character.name),
@@ -422,20 +596,23 @@ export function buildStoryTrailerPrompt(world: World, story: WorldStory, latestC
     const text = transition
       ? `${transition.resolvedBeat}. ${transition.closingImage}. ${transition.nextChapterHook}`
       : chapter.beats.map((beat) => `${beat.description}. ${beat.caption}.`).join(" ") || chapter.narration;
-    return `${index + 1}. ${sanitizeCreativeText(text, identities, 330)}`;
+    return `${index + 1}. ${sanitizeCreativeText(text, identities, 220)}`;
   });
   const premise = sanitizeCreativeText(world.premise, identities, 420);
   const direction = sanitizeCreativeText(world.creatorPrompt, identities, 280);
-  const worldState = sanitizeCreativeText(story.worldState, identities, 220);
   const currentEnding = sanitizeCreativeText(
     latestChapter.transition?.closingImage ?? latestChapter.beats.at(-1)?.description ?? latestChapter.narration,
     identities,
     300,
   );
+  const scopeDirection = kind === "chapter"
+    ? `Show only the events, emotion, and turning point of Chapter ${latestChapter.number}. Do not recap earlier chapters.`
+    : `Show the story journey from Chapter 1 through Chapter ${latestChapter.number}, joining the most important turning points into one clear arc.`;
   return [
-    "Create an eight-second, 16:9 cinematic trailer glimpse for an original fictional story universe.",
+    "Create a twelve-second, 16:9 cinematic video for an original fictional story universe.",
+    scopeDirection,
     `Genre and atmosphere: ${sanitizeCreativeText(world.genre, identities, 160)}.`,
-    `Original premise: ${premise}. Creator direction: ${direction}. Current world pressure: ${worldState}.`,
+    `Original premise: ${premise}. Creator direction: ${direction}.`,
     "Tell one coherent visual rise in three to four rapid, connected shots: establish the world, reveal a central conflict, escalate the danger, and end on a clean, emotionally charged final image that invites the next chapter.",
     "Use unnamed, original characters with distinct but non-iconic silhouettes. Preserve broad setting, emotional continuity, and cause-and-effect from these saved story moments:",
     ...moments,
@@ -446,8 +623,7 @@ export function buildStoryTrailerPrompt(world: World, story: WorldStory, latestC
 }
 
 function selectTrailerChapters(chapters: StoryChapter[]): StoryChapter[] {
-  if (chapters.length <= 6) return chapters;
-  return [...chapters.slice(0, 2), ...chapters.slice(-4)];
+  return chapters;
 }
 
 function sanitizeCreativeText(value: string, identities: string[], maximum: number): string {
@@ -465,6 +641,17 @@ function sanitizeCreativeText(value: string, identities: string[], maximum: numb
   return output.length > maximum ? `${output.slice(0, maximum - 1).trimEnd()}…` : output;
 }
 
+function sanitizeEditText(value: string, identities: string[], maximum: number): string {
+  let output = value.replace(/\s+/g, " ").trim();
+  const terms = [...identities, ...protectedTerms]
+    .map((term) => term.trim())
+    .filter((term) => term.length >= 2)
+    .sort((left, right) => right.length - left.length);
+  for (const term of terms) output = output.replace(new RegExp(`\\b${escapeRegExp(term)}\\b`, "giu"), "an original figure");
+  output = output.replace(/\s+/g, " ").trim();
+  return output.length > maximum ? `${output.slice(0, maximum - 1).trimEnd()}…` : output;
+}
+
 const protectedTerms = [
   "avengers", "marvel", "dc comics", "star wars", "harry potter", "lord of the rings", "game of thrones", "bahubali", "baahubali", "disney", "pixar", "netflix",
 ];
@@ -477,9 +664,20 @@ function normalizedRevision(value: unknown): number {
   return typeof value === "number" && Number.isInteger(value) && value >= 1 ? value : 1;
 }
 
+function normalizedEditPrompt(value: unknown): string {
+  if (typeof value !== "string") {
+    throw new StoryTrailerError("invalid_edit_prompt", "Describe the video changes in 3 to 800 characters.", 400);
+  }
+  const normalized = value.replace(/\s+/g, " ").trim();
+  if (normalized.length < 3 || normalized.length > 800) {
+    throw new StoryTrailerError("invalid_edit_prompt", "Describe the video changes in 3 to 800 characters.", 400);
+  }
+  return normalized;
+}
+
 function configuredSeconds(value: unknown): StoryTrailerSeconds {
   const number = Number(value);
-  return (supportedSeconds as readonly number[]).includes(number) ? number as StoryTrailerSeconds : 8;
+  return (supportedSeconds as readonly number[]).includes(number) ? number as StoryTrailerSeconds : 12;
 }
 
 function configuredSize(value: unknown): StoryTrailerSize {

@@ -41,7 +41,7 @@ env:
     value: "120000"
 
   - name: STORYVERSE_TRAILER_SECONDS
-    value: "8"
+    value: "12"
 
   - name: STORYVERSE_TRAILER_SIZE
     value: 1280x720

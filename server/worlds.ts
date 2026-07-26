@@ -5,6 +5,7 @@ import type {
   NewStoryTrailer,
   StoredStoryTrailer,
   StoryTrailerRetryReservation,
+  StoryTrailerKind,
   StoryTrailerStatus,
 } from "./persistence/store.js";
 import { MAX_UPCOMING_DIRECTIONS, type StoryChapter, type WorldStory } from "./story.js";
@@ -81,6 +82,7 @@ export class WorldStore {
       world_id TEXT NOT NULL,
       chapter_id TEXT NOT NULL,
       chapter_revision INTEGER NOT NULL,
+      kind TEXT NOT NULL DEFAULT 'story_so_far',
       prompt_version TEXT NOT NULL,
       prompt TEXT NOT NULL,
       status TEXT NOT NULL,
@@ -95,7 +97,12 @@ export class WorldStore {
       updated_at TEXT NOT NULL,
       FOREIGN KEY(world_id) REFERENCES worlds(id)
     )`);
+    const trailerColumns = db.prepare("PRAGMA table_info(story_trailers)").all() as Array<{ name: string }>;
+    if (!trailerColumns.some((column) => column.name === "kind")) {
+      db.exec("ALTER TABLE story_trailers ADD COLUMN kind TEXT NOT NULL DEFAULT 'story_so_far'");
+    }
     db.exec("CREATE INDEX IF NOT EXISTS story_trailers_lookup_idx ON story_trailers(world_id, chapter_id, chapter_revision, updated_at DESC)");
+    db.exec("CREATE INDEX IF NOT EXISTS story_trailers_kind_lookup_idx ON story_trailers(world_id, chapter_id, chapter_revision, kind, updated_at DESC)");
     db.exec("CREATE INDEX IF NOT EXISTS story_trailers_status_idx ON story_trailers(status, updated_at DESC)");
     db.exec(`CREATE TABLE IF NOT EXISTS world_stories (
       world_id TEXT PRIMARY KEY,
@@ -411,13 +418,13 @@ export class WorldStore {
     };
     try {
       this.db.prepare(`INSERT INTO story_trailers (
-        id, cache_key, world_id, chapter_id, chapter_revision, prompt_version,
+        id, cache_key, world_id, chapter_id, chapter_revision, kind, prompt_version,
         prompt, status, progress, video_url, provider, provider_job_id,
         provider_asset_id, error_code, retry_count, created_at, updated_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
         .run(
           trailer.id, trailer.cacheKey, trailer.worldId, trailer.chapterId,
-          trailer.chapterRevision, trailer.promptVersion, trailer.prompt, trailer.status,
+          trailer.chapterRevision, trailer.kind, trailer.promptVersion, trailer.prompt, trailer.status,
           trailer.progress, null, null, null, null, null, trailer.retryCount,
           trailer.createdAt, trailer.updatedAt,
         );
@@ -434,11 +441,19 @@ export class WorldStore {
     return row ? rowToStoryTrailer(row) : null;
   }
 
-  public findStoryTrailer(worldId: string, chapterId: string, chapterRevision: number): StoredStoryTrailer | null {
+  public findStoryTrailer(worldId: string, chapterId: string, chapterRevision: number, kind: StoryTrailerKind): StoredStoryTrailer | null {
     const row = this.db.prepare(`SELECT * FROM story_trailers
-      WHERE world_id = ? AND chapter_id = ? AND chapter_revision = ?
-      ORDER BY updated_at DESC LIMIT 1`)
-      .get(worldId, chapterId, chapterRevision) as unknown as StoryTrailerRow | undefined;
+      WHERE world_id = ? AND chapter_id = ? AND chapter_revision = ? AND kind = ?
+      ORDER BY updated_at DESC, created_at DESC, rowid DESC LIMIT 1`)
+      .get(worldId, chapterId, chapterRevision, kind) as unknown as StoryTrailerRow | undefined;
+    return row ? rowToStoryTrailer(row) : null;
+  }
+
+  public findReadyStoryTrailer(worldId: string, chapterId: string, chapterRevision: number, kind: StoryTrailerKind): StoredStoryTrailer | null {
+    const row = this.db.prepare(`SELECT * FROM story_trailers
+      WHERE world_id = ? AND chapter_id = ? AND chapter_revision = ? AND kind = ? AND status = 'ready'
+      ORDER BY updated_at DESC, created_at DESC, rowid DESC LIMIT 1`)
+      .get(worldId, chapterId, chapterRevision, kind) as unknown as StoryTrailerRow | undefined;
     return row ? rowToStoryTrailer(row) : null;
   }
 
@@ -515,7 +530,7 @@ type StoryImageRow = {
 
 type StoryTrailerRow = {
   id: string; cache_key: string; world_id: string; chapter_id: string;
-  chapter_revision: number; prompt_version: string; prompt: string;
+  chapter_revision: number; kind: StoryTrailerKind; prompt_version: string; prompt: string;
   status: StoryTrailerStatus; progress: number; video_url: string | null;
   provider: string | null; provider_job_id: string | null; provider_asset_id: string | null;
   error_code: string | null; retry_count: number; created_at: string; updated_at: string;
@@ -619,6 +634,7 @@ function rowToStoryTrailer(row: StoryTrailerRow): StoredStoryTrailer {
     worldId: row.world_id,
     chapterId: row.chapter_id,
     chapterRevision: row.chapter_revision,
+    kind: row.kind,
     promptVersion: row.prompt_version,
     prompt: row.prompt,
     status: row.status,

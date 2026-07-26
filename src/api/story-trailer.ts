@@ -1,4 +1,5 @@
 export type StoryTrailerStatus = "queued" | "in_progress" | "ready" | "failed";
+export type StoryTrailerKind = "chapter" | "story_so_far";
 
 /**
  * Safe trailer metadata intentionally excludes provider job identifiers and
@@ -9,6 +10,7 @@ export type PublicStoryTrailer = {
   worldId: string;
   chapterId: string;
   chapterRevision: number;
+  kind: StoryTrailerKind;
   status: StoryTrailerStatus;
   progress: number;
   videoUrl?: string;
@@ -34,6 +36,7 @@ function isTrailer(value: unknown): value is PublicStoryTrailer {
   return typeof value.worldId === "string"
     && typeof value.chapterId === "string"
     && typeof value.chapterRevision === "number"
+    && (value.kind === "chapter" || value.kind === "story_so_far")
     && typeof value.status === "string"
     && statusValues.has(value.status as StoryTrailerStatus)
     && typeof value.progress === "number"
@@ -93,19 +96,40 @@ async function request(path: string, init?: RequestInit): Promise<TrailerRespons
 
 export function getStoryTrailer(
   worldId: string,
+  chapterId: string,
+  kind: StoryTrailerKind,
   init?: Pick<RequestInit, "signal">,
 ): Promise<TrailerResponse> {
-  return request(`/api/worlds/${encodeURIComponent(worldId)}/story/trailer`, init);
+  return request(
+    `/api/worlds/${encodeURIComponent(worldId)}/story/chapters/${encodeURIComponent(chapterId)}/trailers/${kind}`,
+    init,
+  );
 }
 
 export function requestStoryTrailer(
   worldId: string,
+  chapterId: string,
+  kind: StoryTrailerKind,
   options: { retry?: boolean; signal?: AbortSignal } = {},
 ): Promise<TrailerResponse> {
-  return request(`/api/worlds/${encodeURIComponent(worldId)}/story/trailer`, {
+  return request(`/api/worlds/${encodeURIComponent(worldId)}/story/chapters/${encodeURIComponent(chapterId)}/trailers/${kind}`, {
     method: "POST",
     signal: options.signal,
     body: JSON.stringify(options.retry ? { retry: true } : {}),
+  });
+}
+
+export function editStoryTrailer(
+  worldId: string,
+  chapterId: string,
+  kind: StoryTrailerKind,
+  prompt: string,
+  options: Pick<RequestInit, "signal"> = {},
+): Promise<TrailerResponse> {
+  return request(`/api/worlds/${encodeURIComponent(worldId)}/story/chapters/${encodeURIComponent(chapterId)}/trailers/${kind}/remix`, {
+    method: "POST",
+    signal: options.signal,
+    body: JSON.stringify({ prompt }),
   });
 }
 

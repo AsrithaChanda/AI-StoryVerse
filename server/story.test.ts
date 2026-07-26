@@ -101,8 +101,10 @@ describe("persistent created-world stories", () => {
     const story = await generateInitialStory(world);
     const request = fetchMock.mock.calls[0]?.[1];
     if (!request) throw new Error("Expected the initial model request to include an init object");
-    const requestBody = JSON.parse(String(request.body)) as { text: { format: { schema: { properties: Record<string, { required?: string[] }> } } } };
+    const requestBody = JSON.parse(String(request.body)) as { instructions: string; text: { format: { schema: { properties: Record<string, { required?: string[] }> } } } };
 
+    expect(requestBody.instructions).toContain("clear, natural Indian English");
+    expect(requestBody.instructions).toContain("seven to ten small paragraphs");
     expect(requestBody.text.format.schema.properties.characters).not.toHaveProperty("maxItems");
     expect(requestBody.text.format.schema.properties.chapter?.required).toContain("transition");
     expect(story.characters).toHaveLength(5);
@@ -366,6 +368,7 @@ describe("persistent created-world stories", () => {
     expect(body.input).toContain("Prior chapter transition (compact continuity contract):");
     expect(body.input).toContain("Carry forward the immediate consequence");
     expect(body.instructions).toContain("Address or escalate the prior transition's nextChapterHook in an immediate beat early in this chapter");
+    expect(body.instructions).toContain("clear, natural Indian English");
   });
 
   it("clamps structured-output budget and treats incomplete Responses results as failed generation", async () => {

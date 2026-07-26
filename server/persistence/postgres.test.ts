@@ -122,6 +122,7 @@ function trailerRow(overrides: Partial<Record<string, unknown>> = {}): Record<st
     world_id: "world-1",
     chapter_id: "chapter-3",
     chapter_revision: 1,
+    kind: "story_so_far",
     prompt_version: "storyverse-trailer-v1",
     prompt: "A private trailer prompt that must not leave the server.",
     status: "queued",
@@ -247,6 +248,7 @@ describe("PostgresWorldStore migrations", () => {
     expect(pool.calls.some((call) => includes(call, "CREATE TABLE IF NOT EXISTS world_stories"))).toBe(true);
     expect(pool.calls.some((call) => includes(call, "CREATE TABLE IF NOT EXISTS story_images"))).toBe(true);
     expect(pool.calls.some((call) => includes(call, "CREATE TABLE IF NOT EXISTS story_trailers"))).toBe(true);
+    expect(pool.calls.some((call) => includes(call, "ADD COLUMN IF NOT EXISTS kind"))).toBe(true);
     expect(pool.releases).toBe(1);
   });
 
@@ -372,6 +374,18 @@ describe("PostgresWorldStore image cache", () => {
 });
 
 describe("PostgresWorldStore trailer cache", () => {
+  it("looks up each saved video type independently", async () => {
+    const pool = new RecordingPool((call) => includes(call, "SELECT * FROM story_trailers")
+      ? { rows: [trailerRow({ kind: "chapter" })], rowCount: 1 }
+      : { rows: [], rowCount: 0 });
+    const store = await initializedStore(pool);
+
+    await expect(store.findStoryTrailer("world-1", "chapter-3", 1, "chapter"))
+      .resolves.toMatchObject({ kind: "chapter" });
+    const lookup = pool.calls.find((call) => includes(call, "chapter_revision = $3 AND kind = $4"));
+    expect(lookup?.values).toEqual(["world-1", "chapter-3", 1, "chapter"]);
+  });
+
   it("uses INSERT ON CONFLICT for cross-instance trailer reservations and returns the existing render", async () => {
     const existing = trailerRow({ status: "ready", progress: 100, video_url: "/api/worlds/world-1/trailer/content", provider: "sora-2" });
     const pool = new RecordingPool((call) => {
@@ -382,6 +396,7 @@ describe("PostgresWorldStore trailer cache", () => {
     const store = await initializedStore(pool);
     const reserved = await store.reserveStoryTrailer({
       cacheKey: "trailer-key", worldId: "world-1", chapterId: "chapter-3", chapterRevision: 1,
+      kind: "story_so_far",
       promptVersion: "storyverse-trailer-v1", prompt: "A private trailer prompt that must not leave the server.",
     });
 

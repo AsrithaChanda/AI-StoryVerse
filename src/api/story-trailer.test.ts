@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
+  editStoryTrailer,
   getStoryTrailer,
   isStoryTrailerRequestError,
   requestStoryTrailer,
@@ -10,6 +11,7 @@ const trailer = {
   worldId: "world-1",
   chapterId: "chapter-1",
   chapterRevision: 2,
+  kind: "story_so_far" as const,
   status: "queued" as const,
   progress: 0,
   updatedAt: "2026-07-26T10:00:00.000Z",
@@ -29,9 +31,9 @@ describe("story trailer API client", () => {
     const fetchMock = vi.fn().mockResolvedValue(jsonResponse({ trailer }));
     vi.stubGlobal("fetch", fetchMock);
 
-    await expect(getStoryTrailer("world / one")).resolves.toEqual({ trailer });
+    await expect(getStoryTrailer("world / one", "chapter / one", "story_so_far")).resolves.toEqual({ trailer });
     expect(fetchMock).toHaveBeenCalledWith(
-      "/api/worlds/world%20%2F%20one/story/trailer",
+      "/api/worlds/world%20%2F%20one/story/chapters/chapter%20%2F%20one/trailers/story_so_far",
       expect.objectContaining({ headers: expect.any(Headers) }),
     );
   });
@@ -42,17 +44,17 @@ describe("story trailer API client", () => {
       .mockResolvedValueOnce(jsonResponse({ trailer: { ...trailer, status: "in_progress", progress: 28 } }));
     vi.stubGlobal("fetch", fetchMock);
 
-    await requestStoryTrailer("world / one");
-    await requestStoryTrailer("world / one", { retry: true });
+    await requestStoryTrailer("world / one", "chapter / one", "story_so_far");
+    await requestStoryTrailer("world / one", "chapter / one", "story_so_far", { retry: true });
 
     expect(fetchMock).toHaveBeenNthCalledWith(
       1,
-      "/api/worlds/world%20%2F%20one/story/trailer",
+      "/api/worlds/world%20%2F%20one/story/chapters/chapter%20%2F%20one/trailers/story_so_far",
       expect.objectContaining({ method: "POST", body: "{}" }),
     );
     expect(fetchMock).toHaveBeenNthCalledWith(
       2,
-      "/api/worlds/world%20%2F%20one/story/trailer",
+      "/api/worlds/world%20%2F%20one/story/chapters/chapter%20%2F%20one/trailers/story_so_far",
       expect.objectContaining({ method: "POST", body: JSON.stringify({ retry: true }) }),
     );
   });
@@ -64,7 +66,7 @@ describe("story trailer API client", () => {
     }, 503)));
 
     try {
-      await requestStoryTrailer("world-1");
+      await requestStoryTrailer("world-1", "chapter-1", "story_so_far");
       throw new Error("Expected requestStoryTrailer to reject");
     } catch (error) {
       expect(isStoryTrailerRequestError(error)).toBe(true);
@@ -78,6 +80,21 @@ describe("story trailer API client", () => {
   it("rejects malformed successful payloads instead of rendering unsafe metadata", async () => {
     vi.stubGlobal("fetch", vi.fn().mockResolvedValue(jsonResponse({ trailer: { status: "ready" } })));
 
-    await expect(getStoryTrailer("world-1")).rejects.toThrow("The trailer service returned an invalid response.");
+    await expect(getStoryTrailer("world-1", "chapter-1", "story_so_far")).rejects.toThrow("The trailer service returned an invalid response.");
+  });
+
+  it("submits a prompt-driven remix for one chapter", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(jsonResponse({ trailer }));
+    vi.stubGlobal("fetch", fetchMock);
+
+    await editStoryTrailer("world / one", "chapter / one", "story_so_far", "Use a slower final camera move.");
+
+    expect(fetchMock).toHaveBeenCalledWith(
+      "/api/worlds/world%20%2F%20one/story/chapters/chapter%20%2F%20one/trailers/story_so_far/remix",
+      expect.objectContaining({
+        method: "POST",
+        body: JSON.stringify({ prompt: "Use a slower final camera move." }),
+      }),
+    );
   });
 });

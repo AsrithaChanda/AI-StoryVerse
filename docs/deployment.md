@@ -26,8 +26,8 @@ Copy [`.env.example`](../.env.example) to `.env` for local work. Do not commit `
 | `DATABRICKS_TOKEN` | `databricks-volume` only when M2M credentials are not used | Static bearer-token compatibility fallback for short-lived local/PAT testing. Do not use it as the primary production credential. |
 | `DATABRICKS_VOLUME_PATH` | `databricks-volume` | `/Volumes/<catalog>/<schema>/<volume>/storyverse`; StoryVerse creates media beneath this root. |
 | `OPENAI_API_KEY` | Live world, chapter, perspective, image, narration, or on-demand trailer generation | Server-only OpenAI credential. The app still starts without it, but live generation falls back or is unavailable as appropriate. |
-| `OPENAI_VIDEO_MODEL` | On-demand Story Trailer generation | Async video model, default `sora-2`; generation is explicit from the newest canonical chapter only. |
-| `STORYVERSE_TRAILER_SECONDS`, `STORYVERSE_TRAILER_SIZE` | On-demand Story Trailer generation | Optional video duration (`4`, `8`, or `12`) and supported frame size; defaults are `8` and `1280x720`. |
+| `OPENAI_VIDEO_MODEL` | On-demand Story Trailer generation | Async video model, default `sora-2`; generation and prompt-driven remixing are explicit actions available on every canonical chapter. |
+| `STORYVERSE_TRAILER_SECONDS`, `STORYVERSE_TRAILER_SIZE` | On-demand story video generation | Optional video duration (`4`, `8`, or `12`) and supported frame size; deployment defaults are `12` and `1280x720`. |
 | `PORT` | Local/Docker | HTTP port. Databricks Apps supplies the Express `PORT` at runtime. |
 
 For Lakebase, use `PGSSLMODE=require`. Do not use the development PostgreSQL password from `docker-compose.yml` outside a local machine.
@@ -76,7 +76,7 @@ Then verify the service and PostgreSQL-backed health response:
 curl --fail --silent http://127.0.0.1:8787/api/health
 ```
 
-Open `http://127.0.0.1:8787`, create a world, generate a chapter, refresh the browser, and reopen the world. Generate at least one image and narration asset if an OpenAI key is configured. Optionally request a Story Trailer from the newest canonical chapter; it renders asynchronously and the completed MP4 is persisted alongside other media. Recreate the application container with `docker compose up --build` and confirm the world and generated media remain visible.
+Open `http://127.0.0.1:8787`, create a world, generate a chapter, refresh the browser, and reopen the world. Generate at least one image and narration asset if an OpenAI key is configured. Optionally request a Story Trailer for multiple chapters and remix one with an edit prompt; each render runs asynchronously and every completed MP4 is persisted alongside other media. Recreate the application container with `docker compose up --build` and confirm the world and generated media remain visible.
 
 Run the release checks outside or before the container build:
 

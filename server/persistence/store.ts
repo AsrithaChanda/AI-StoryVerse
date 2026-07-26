@@ -33,6 +33,7 @@ export type StoryImageReservation = {
 
 /** Lifecycle state for an on-demand, asynchronous story trailer render. */
 export type StoryTrailerStatus = "queued" | "in_progress" | "ready" | "failed";
+export type StoryTrailerKind = "chapter" | "story_so_far";
 
 /**
  * Input persisted before a paid video render is requested. `cacheKey` is a
@@ -44,6 +45,7 @@ export type NewStoryTrailer = {
   worldId: string;
   chapterId: string;
   chapterRevision: number;
+  kind: StoryTrailerKind;
   promptVersion: string;
   /** Server-only generation instructions. Never return this to browsers. */
   prompt: string;
@@ -94,6 +96,10 @@ export function toPublicStoryTrailer(trailer: StoredStoryTrailer): PublicStoryTr
     providerAssetId: _providerAssetId,
     ...publicTrailer
   } = trailer;
+  void _cacheKey;
+  void _prompt;
+  void _providerJobId;
+  void _providerAssetId;
   return publicTrailer;
 }
 
@@ -144,6 +150,13 @@ export interface StoryStore {
     worldId: string,
     chapterId: string,
     chapterRevision: number,
+    kind: StoryTrailerKind,
+  ): MaybePromise<StoredStoryTrailer | null>;
+  findReadyStoryTrailer(
+    worldId: string,
+    chapterId: string,
+    chapterRevision: number,
+    kind: StoryTrailerKind,
   ): MaybePromise<StoredStoryTrailer | null>;
   markStoryTrailerQueued(
     cacheKey: string,

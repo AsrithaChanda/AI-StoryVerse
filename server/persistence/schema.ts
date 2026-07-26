@@ -78,6 +78,15 @@ export const POSTGRES_SCHEMA_MIGRATIONS = [
       "CREATE INDEX IF NOT EXISTS story_trailers_status_idx ON story_trailers(status, updated_at DESC)",
     ],
   },
+  {
+    id: "003_story_trailer_kinds",
+    statements: [
+      "ALTER TABLE story_trailers ADD COLUMN IF NOT EXISTS kind TEXT NOT NULL DEFAULT 'story_so_far'",
+      "ALTER TABLE story_trailers DROP CONSTRAINT IF EXISTS story_trailers_kind_check",
+      "ALTER TABLE story_trailers ADD CONSTRAINT story_trailers_kind_check CHECK (kind IN ('chapter', 'story_so_far'))",
+      "CREATE INDEX IF NOT EXISTS story_trailers_kind_lookup_idx ON story_trailers(world_id, chapter_id, chapter_revision, kind, updated_at DESC)",
+    ],
+  },
 ] as const;
 
 export const POSTGRES_MIGRATIONS_TABLE = "storyverse_schema_migrations";

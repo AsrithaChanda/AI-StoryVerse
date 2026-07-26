@@ -34,7 +34,7 @@ export async function generateWorld(input: CreateWorldInput): Promise<GeneratedW
       headers: { "Content-Type": "application/json", Authorization: `Bearer ${key}` },
       body: JSON.stringify({
         model: process.env.OPENAI_MODEL || "gpt-4.1-mini",
-        instructions: "You create concise, original interactive story worlds. Never imitate a named author or existing franchise. Return only JSON matching the requested schema. Create a persistent cast appropriate to the brief; do not limit it to a fixed number of characters.",
+        instructions: "You create concise, original interactive story worlds. Use clear, natural Indian English with simple vocabulary, short sentences, and a short opening paragraph. Avoid heavy literary words, American slang, and exaggerated Indian expressions. Never imitate a named author or existing franchise. Return only JSON matching the requested schema. Create a persistent cast appropriate to the brief; do not limit it to a fixed number of characters.",
         input: `Create an original world from this brief. Title: ${input.title}. Genre: ${input.genre}. Premise: ${input.premise}. Creator note: ${input.creatorPrompt}. Include every core character this world needs, each with a concise role and trait.`,
         text: {
           format: {

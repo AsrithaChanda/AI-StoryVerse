@@ -474,8 +474,9 @@ async function modelJsonStream<T>(
 }
 
 const originalGuard = "Create original characters and an original plot. A user-supplied title or genre may evoke an existing work, but never reuse protected named characters, dialogue, plot events, costumes, or scenes from it. Do not include real-world celebrity likenesses.";
-const transitionInstruction = "Write 1,200–1,700 characters of narration in four to six short paragraphs, reserving a final closing paragraph rather than writing to the response limit. Finish narration with a complete terminal sentence, never mid-sentence. Every canonical chapter must resolve one immediate beat inside its own events and end as a deliberate, satisfying unit. Return transition with resolvedBeat (what this chapter actually settles), closingImage (the earned final image), nextChapterHook (one fresh immediate pressure only), and carryForward (an array of one to four concise facts or consequences the next chapter must honor).";
-const chapterRepairInstruction = "A prior draft was rejected by the canonical chapter validator. Produce a fresh, complete replacement now: write 1,200–1,600 characters in four to six short paragraphs, reserve a final closing paragraph, retain every required JSON field, include a valid transition, use three or four imageable beats, and end narration with a completed terminal sentence. Never return a partial draft.";
+const simpleIndianEnglishInstruction = "Use clear, natural Indian English. Keep the vocabulary simple and the sentences easy to follow. Use seven to ten small paragraphs, with one to three short sentences in each paragraph. Prefer direct description and natural dialogue. Avoid heavy literary words, long sentences, American slang, and exaggerated Indian expressions.";
+const transitionInstruction = `${simpleIndianEnglishInstruction} Write 1,200–1,700 characters of narration and reserve a final closing paragraph rather than writing to the response limit. Finish narration with a complete terminal sentence, never mid-sentence. Every canonical chapter must resolve one immediate beat inside its own events and end as a deliberate, satisfying unit. Return transition with resolvedBeat (what this chapter actually settles), closingImage (the earned final image), nextChapterHook (one fresh immediate pressure only), and carryForward (an array of one to four concise facts or consequences the next chapter must honour).`;
+const chapterRepairInstruction = `A prior draft was rejected by the canonical chapter validator. Produce a fresh, complete replacement now. ${simpleIndianEnglishInstruction} Write 1,200–1,600 characters, reserve a final closing paragraph, retain every required JSON field, include a valid transition, use three or four imageable beats, and end narration with a completed terminal sentence. Never return a partial draft.`;
 
 type CanonicalRequest = { instructions: string; input: string; responseSchema: object };
 
@@ -600,7 +601,7 @@ export async function generatePerspective(world: World, story: WorldStory, chara
   if (!character || !chapter) return null;
   const perspectiveSchema = { type: "object", additionalProperties: false, required: ["narration", "beats"], properties: { narration: { type: "string", minLength: 280, maxLength: 2200 }, beats: schema.properties.chapter.properties.beats } };
   const payload = await modelJson<{ narration: string; beats: StoryBeat[] }>(
-    `You write an original character point-of-view retelling. ${originalGuard} Use only the selected character's stated memories, personality, goal, and observations. Never invent hidden knowledge from other characters.`,
+    `You write an original character point-of-view retelling. ${originalGuard} ${simpleIndianEnglishInstruction} Use only the selected character's stated memories, personality, goal, and observations. Never invent hidden knowledge from other characters.`,
     `World: ${world.title}\nSelected character: ${JSON.stringify(character)}\nCurrent chapter: ${chapter.narration}\nReturn a close POV retelling and 3–4 imageable beats.`, perspectiveSchema,
   );
   if (!payload?.narration || !Array.isArray(payload.beats)) return null;
@@ -620,7 +621,7 @@ export async function generatePerspectiveStream(
   if (!character || !chapter) return null;
   const perspectiveSchema = { type: "object", additionalProperties: false, required: ["narration", "beats"], properties: { narration: { type: "string", minLength: 280, maxLength: 2200 }, beats: schema.properties.chapter.properties.beats } };
   const payload = await modelJsonStream<{ narration: string; beats: StoryBeat[] }>(
-    `You write an original character point-of-view retelling. ${originalGuard} Use only the selected character's stated memories, personality, goal, and observations. Never invent hidden knowledge from other characters.`,
+    `You write an original character point-of-view retelling. ${originalGuard} ${simpleIndianEnglishInstruction} Use only the selected character's stated memories, personality, goal, and observations. Never invent hidden knowledge from other characters.`,
     `World: ${world.title}\nSelected character: ${JSON.stringify(character)}\nCurrent chapter: ${chapter.narration}\nReturn a close POV retelling and 3–4 imageable beats.`, perspectiveSchema,
     callbacks,
   );

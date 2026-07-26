@@ -39,6 +39,7 @@ describe("world archive", () => {
     });
     const reserveTrailer = (worldId: string) => store.reserveStoryTrailer({
       cacheKey: `trailer-${worldId}`, worldId, chapterId: "chapter-1", chapterRevision: 1,
+      kind: "story_so_far" as const,
       promptVersion: "test", prompt: "A concise trailer prompt that is never returned to a browser.",
     });
     saveStory(target.id);
@@ -52,11 +53,11 @@ describe("world archive", () => {
     expect(store.get(target.id)).toBeNull();
     expect(store.getWorldStory(target.id)).toBeNull();
     expect(store.findStoryImage(target.id, "chapter-1-beat-1")).toBeNull();
-    expect(store.findStoryTrailer(target.id, "chapter-1", 1)).toBeNull();
+    expect(store.findStoryTrailer(target.id, "chapter-1", 1, "story_so_far")).toBeNull();
     expect(store.get(survivor.id)?.title).toBe("Keep Me");
     expect(store.getWorldStory(survivor.id)).not.toBeNull();
     expect(store.findStoryImage(survivor.id, "chapter-1-beat-1")).not.toBeNull();
-    expect(store.findStoryTrailer(survivor.id, "chapter-1", 1)).not.toBeNull();
+    expect(store.findStoryTrailer(survivor.id, "chapter-1", 1, "story_so_far")).not.toBeNull();
     expect(store.deleteWorld("missing-world")).toBe(false);
   });
 
@@ -170,6 +171,7 @@ describe("world archive", () => {
       worldId: world.id,
       chapterId: "chapter-1",
       chapterRevision: 2,
+      kind: "story_so_far" as const,
       promptVersion: "storyverse-trailer-v1",
       prompt: "A server-only cinematic trailer prompt for the current story snapshot.",
     };
@@ -191,6 +193,8 @@ describe("world archive", () => {
     expect(store.markStoryTrailerReady(input.cacheKey, {
       videoUrl: "/api/worlds/trailer/content", provider: "sora-2", providerAssetId: "volumes/path/trailer.mp4",
     })).toMatchObject({ status: "ready", progress: 100, videoUrl: "/api/worlds/trailer/content" });
+    expect(store.findReadyStoryTrailer(world.id, input.chapterId, input.chapterRevision, input.kind))
+      .toMatchObject({ cacheKey: input.cacheKey, status: "ready" });
 
     // A stale provider poll must not turn a completed trailer back into a pending one.
     expect(store.markStoryTrailerProgress(input.cacheKey, 30, "in_progress"))
@@ -222,12 +226,12 @@ describe("world archive", () => {
         { id: "chapter-2", number: 2, title: "Second", narration: "The second chapter is eligible for a trailer until it is removed.", beats: [] },
       ],
     });
-    store.reserveStoryTrailer({ cacheKey: "trailer-first", worldId: world.id, chapterId: "chapter-1", chapterRevision: 1, promptVersion: "v1", prompt: "First trailer." });
-    store.reserveStoryTrailer({ cacheKey: "trailer-second", worldId: world.id, chapterId: "chapter-2", chapterRevision: 1, promptVersion: "v1", prompt: "Second trailer." });
+    store.reserveStoryTrailer({ cacheKey: "trailer-first", worldId: world.id, chapterId: "chapter-1", chapterRevision: 1, kind: "story_so_far", promptVersion: "v1", prompt: "First trailer." });
+    store.reserveStoryTrailer({ cacheKey: "trailer-second", worldId: world.id, chapterId: "chapter-2", chapterRevision: 1, kind: "story_so_far", promptVersion: "v1", prompt: "Second trailer." });
 
     const result = store.deleteFutureChapters(world.id, "chapter-1");
     expect(result).toMatchObject({ ok: true, value: { removedChapterIds: ["chapter-2"] } });
-    expect(store.findStoryTrailer(world.id, "chapter-1", 1)).not.toBeNull();
-    expect(store.findStoryTrailer(world.id, "chapter-2", 1)).toBeNull();
+    expect(store.findStoryTrailer(world.id, "chapter-1", 1, "story_so_far")).not.toBeNull();
+    expect(store.findStoryTrailer(world.id, "chapter-2", 1, "story_so_far")).toBeNull();
   });
 });

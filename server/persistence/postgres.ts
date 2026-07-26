@@ -20,6 +20,7 @@ import type {
   StoredStoryTrailer,
   StoryTrailerReservation,
   StoryTrailerRetryReservation,
+  StoryTrailerKind,
   StoryTrailerStatus,
   StoryImageReservation,
   StoryWriteOptions,
@@ -208,6 +209,7 @@ type StoryTrailerRow = Record<string, unknown> & {
   world_id: string;
   chapter_id: string;
   chapter_revision: number | string;
+  kind: StoryTrailerKind;
   prompt_version: string;
   prompt: string;
   status: StoryTrailerStatus;
@@ -286,6 +288,7 @@ function rowToStoryTrailer(row: StoryTrailerRow): StoredStoryTrailer {
     worldId: row.world_id,
     chapterId: row.chapter_id,
     chapterRevision: Number(row.chapter_revision),
+    kind: row.kind,
     promptVersion: row.prompt_version,
     prompt: row.prompt,
     status: row.status,
@@ -874,14 +877,14 @@ export class PostgresWorldStore implements VersionedStoryStore {
       updatedAt: timestamp,
     };
     const inserted = await this.pool.query<StoryTrailerRow>(`INSERT INTO story_trailers (
-      id, cache_key, world_id, chapter_id, chapter_revision, prompt_version, prompt,
+      id, cache_key, world_id, chapter_id, chapter_revision, kind, prompt_version, prompt,
       status, progress, video_url, provider, provider_job_id, provider_asset_id,
       error_code, retry_count, created_at, updated_at
     ) VALUES (
-      $1, $2, $3, $4, $5, $6, $7, $8, $9, NULL, NULL, NULL, NULL, NULL, $10, $11, $12
+      $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, NULL, NULL, NULL, NULL, NULL, $11, $12, $13
     ) ON CONFLICT (cache_key) DO NOTHING RETURNING *`, [
       trailer.id, trailer.cacheKey, trailer.worldId, trailer.chapterId, trailer.chapterRevision,
-      trailer.promptVersion, trailer.prompt, trailer.status, trailer.progress, trailer.retryCount,
+      trailer.kind, trailer.promptVersion, trailer.prompt, trailer.status, trailer.progress, trailer.retryCount,
       trailer.createdAt, trailer.updatedAt,
     ]);
     if (inserted.rows[0]) return { trailer: rowToStoryTrailer(inserted.rows[0]), created: true };
@@ -902,11 +905,25 @@ export class PostgresWorldStore implements VersionedStoryStore {
     worldId: string,
     chapterId: string,
     chapterRevision: number,
+    kind: StoryTrailerKind,
   ): Promise<StoredStoryTrailer | null> {
     await this.ready();
     const result = await this.pool.query<StoryTrailerRow>(`SELECT * FROM story_trailers
-      WHERE world_id = $1 AND chapter_id = $2 AND chapter_revision = $3
-      ORDER BY updated_at DESC LIMIT 1`, [worldId, chapterId, chapterRevision]);
+      WHERE world_id = $1 AND chapter_id = $2 AND chapter_revision = $3 AND kind = $4
+      ORDER BY updated_at DESC, created_at DESC, id DESC LIMIT 1`, [worldId, chapterId, chapterRevision, kind]);
+    return result.rows[0] ? rowToStoryTrailer(result.rows[0]) : null;
+  }
+
+  public async findReadyStoryTrailer(
+    worldId: string,
+    chapterId: string,
+    chapterRevision: number,
+    kind: StoryTrailerKind,
+  ): Promise<StoredStoryTrailer | null> {
+    await this.ready();
+    const result = await this.pool.query<StoryTrailerRow>(`SELECT * FROM story_trailers
+      WHERE world_id = $1 AND chapter_id = $2 AND chapter_revision = $3 AND kind = $4 AND status = 'ready'
+      ORDER BY updated_at DESC, created_at DESC, id DESC LIMIT 1`, [worldId, chapterId, chapterRevision, kind]);
     return result.rows[0] ? rowToStoryTrailer(result.rows[0]) : null;
   }
 
