@@ -2,13 +2,13 @@
 
 StoryVerse has two storage modes:
 
-| Environment | Transactional data | Generated images and narration |
+| Environment | Transactional data | Generated images, narration, and trailers |
 | --- | --- | --- |
 | Local development | SQLite when no PostgreSQL configuration is present, or the Docker Compose PostgreSQL service | `data/` on local disk |
 | Container production | PostgreSQL (`DATABASE_URL` or standard `PG*` variables) | Persistent mounted disk only when `STORYVERSE_ASSET_STORAGE=local` |
 | Databricks production | Lakebase PostgreSQL | Unity Catalog Volume through the Databricks Files API |
 
-PostgreSQL is the canonical source for worlds, chapters, perspectives, queued directions, timeline rollbacks, and generated-asset metadata. The asset store holds image and narration bytes; database rows retain their stable asset identity and URL. This split makes concurrent request handling and branch-heavy story data safer while keeping binary media out of database tables.
+PostgreSQL is the canonical source for worlds, chapters, perspectives, queued directions, timeline rollbacks, and generated-asset metadata. The asset store holds image, narration, and trailer bytes; database rows retain their stable asset identity and URL. This split makes concurrent request handling and branch-heavy story data safer while keeping binary media out of database tables.
 
 ## Environment contract
 
@@ -25,7 +25,9 @@ Copy [`.env.example`](../.env.example) to `.env` for local work. Do not commit `
 | `DATABRICKS_CLIENT_ID`, `DATABRICKS_CLIENT_SECRET` | Preferred for `databricks-volume` production | Databricks service-principal OAuth client credentials. StoryVerse exchanges them for cached workspace access tokens. Store both as managed secrets; never put them in source control, plaintext App configuration, or browser-visible settings. |
 | `DATABRICKS_TOKEN` | `databricks-volume` only when M2M credentials are not used | Static bearer-token compatibility fallback for short-lived local/PAT testing. Do not use it as the primary production credential. |
 | `DATABRICKS_VOLUME_PATH` | `databricks-volume` | `/Volumes/<catalog>/<schema>/<volume>/storyverse`; StoryVerse creates media beneath this root. |
-| `OPENAI_API_KEY` | Live world, chapter, perspective, image, or narration generation | Server-only OpenAI credential. The app still starts without it, but live generation falls back or is unavailable as appropriate. |
+| `OPENAI_API_KEY` | Live world, chapter, perspective, image, narration, or on-demand trailer generation | Server-only OpenAI credential. The app still starts without it, but live generation falls back or is unavailable as appropriate. |
+| `OPENAI_VIDEO_MODEL` | On-demand Story Trailer generation | Async video model, default `sora-2`; generation is explicit from the newest canonical chapter only. |
+| `STORYVERSE_TRAILER_SECONDS`, `STORYVERSE_TRAILER_SIZE` | On-demand Story Trailer generation | Optional video duration (`4`, `8`, or `12`) and supported frame size; defaults are `8` and `1280x720`. |
 | `PORT` | Local/Docker | HTTP port. Databricks Apps supplies the Express `PORT` at runtime. |
 
 For Lakebase, use `PGSSLMODE=require`. Do not use the development PostgreSQL password from `docker-compose.yml` outside a local machine.
@@ -74,7 +76,7 @@ Then verify the service and PostgreSQL-backed health response:
 curl --fail --silent http://127.0.0.1:8787/api/health
 ```
 
-Open `http://127.0.0.1:8787`, create a world, generate a chapter, refresh the browser, and reopen the world. Generate at least one image and narration asset if an OpenAI key is configured. Recreate the application container with `docker compose up --build` and confirm the world and generated media remain visible.
+Open `http://127.0.0.1:8787`, create a world, generate a chapter, refresh the browser, and reopen the world. Generate at least one image and narration asset if an OpenAI key is configured. Optionally request a Story Trailer from the newest canonical chapter; it renders asynchronously and the completed MP4 is persisted alongside other media. Recreate the application container with `docker compose up --build` and confirm the world and generated media remain visible.
 
 Run the release checks outside or before the container build:
 
@@ -130,7 +132,7 @@ These are workspace-admin or data-owner actions; they cannot be completed only f
    /Volumes/<catalog>/<schema>/storyverse_assets/storyverse
    ```
 
-   StoryVerse uses it only for non-tabular image and narration files. Lakebase remains the transactional store.
+   StoryVerse uses it only for non-tabular image, narration, and completed trailer files. Lakebase remains the transactional store.
 4. Create or identify a dedicated Databricks service principal for StoryVerse media, generate its OAuth client secret, and **assign the service principal to the target workspace**. For a Databricks App, the App's dedicated service principal can be used when its OAuth client credentials are provided to the runtime through managed configuration.
 5. Create a Databricks App from this repository's Git source or workspace folder. Attach the UC Volume resource with **Can read and write**. Adding a Lakebase App resource is optional: StoryVerse's OAuth handling below is for the Files API only, not Lakebase PostgreSQL credentials, so it is not the native-password path described above.
 6. Add secrets for `PGPASSWORD` (or `DATABASE_URL`), `OPENAI_API_KEY`, `DATABRICKS_CLIENT_ID`, and `DATABRICKS_CLIENT_SECRET` in a secret scope or your workspace's approved secret mechanism. Configure them as managed App values rather than literal text in `app.yaml`. Use `DATABRICKS_TOKEN` only for a short-lived local/PAT compatibility test, not the normal App deployment.
@@ -148,6 +150,7 @@ DATABRICKS_HOST=https://<workspace-host>
 DATABRICKS_VOLUME_PATH=/Volumes/<catalog>/<schema>/storyverse_assets/storyverse
 OPENAI_MODEL=gpt-5.6-luna
 OPENAI_IMAGE_MODEL=gpt-image-2
+OPENAI_VIDEO_MODEL=sora-2
 OPENAI_NARRATION_MODEL=gpt-4o-mini-tts
 ```
 
@@ -175,7 +178,7 @@ After the App reports healthy, verify through the deployed URL and the Apps logs
 - [ ] `GET /api/health` identifies PostgreSQL rather than SQLite and reports success without exposing a connection string or secret.
 - [ ] Creating a world persists it after an App restart/redeploy.
 - [ ] A generated chapter, character POV, direction queue, revision, and timeline prune remain correct after refresh.
-- [ ] New image and narration assets appear under the selected Volume path and are served through StoryVerse’s API routes.
+- [ ] New image, narration, and completed trailer assets appear under the selected Volume path and are served through StoryVerse’s API routes.
 - [ ] Existing cached media loads without triggering a second model request.
 - [ ] The App service principal can read/write only the designated Volume, and the database role has only the privileges StoryVerse requires.
 - [ ] OpenAI credentials, Databricks client credentials, and access tokens never appear in browser code, client API responses, source control, or request logs.
@@ -199,4 +202,4 @@ After the App reports healthy, verify through the deployed URL and the Apps logs
 - Keep distinct development, staging, and production Lakebase branches/databases and Volume roots. Do not point test deployments at production data.
 - Back up/retain PostgreSQL according to your Lakebase policy. Treat generated media as recoverable cache only after confirming the canonical metadata and generator inputs are durable.
 - Do not expose a Volume URI or database credential directly to the browser; browser media should continue to flow through the StoryVerse API.
-- Before rotating `DATABRICKS_CLIENT_SECRET` or `OPENAI_API_KEY`, install the replacement managed secret, redeploy/restart one replica, validate asset generation, then revoke the old credential. If a temporary `DATABRICKS_TOKEN` fallback is in use, rotate it with the same sequence and replace it with OAuth M2M for production.
+- Before rotating `DATABRICKS_CLIENT_SECRET` or `OPENAI_API_KEY`, install the replacement managed secret, redeploy/restart one replica, validate image, narration, and on-demand trailer generation, then revoke the old credential. If a temporary `DATABRICKS_TOKEN` fallback is in use, rotate it with the same sequence and replace it with OAuth M2M for production.

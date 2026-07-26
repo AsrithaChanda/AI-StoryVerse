@@ -18,6 +18,7 @@ No prewritten or seeded story universe is included. The archive starts empty and
 - Continue the story chapter by chapter with live draft prose streaming into a clear generation stage. A completed canonical chapter opens only after its complete visual sequence is restored from cache or resolved to ready/fallback frames.
 - Browse the whole persistent cast in a searchable directory, then switch the current chapter to any selected character’s point of view with the same progressive loading treatment.
 - Generate and cache cinematic illustrations for chapter beats and character perspectives. Content-addressed image URLs are served through the same API from local development storage or a private Databricks Volume in production, then browser-cached for immediate revisits.
+- At the newest canonical chapter, request an on-demand **Story Trailer**: an original, chapter-aware 8-second video glimpse that renders asynchronously while the reader remains usable. Its job status is persisted and the completed MP4 is copied into the configured local storage or private Databricks Volume for later playback.
 - Listen to the displayed canonical or character-perspective prose with selected narration speed and restart controls.
 - Hear a scene-appropriate local BGM track selected by the chapter-audio director.
 
@@ -39,6 +40,8 @@ Add `OPENAI_API_KEY` to `.env` to enable live world, chapter, perspective, image
 - `STORYVERSE_STORY_MAX_OUTPUT_TOKENS` — output budget for a complete structured chapter and its closing handoff (default `6000`)
 - `OPENAI_IMAGE_MODEL` — image generation
 - `STORYVERSE_IMAGE_QUALITY` — optional `low`, `medium`, or `high` image quality (`low` prioritizes visual turnaround over detail)
+- `OPENAI_VIDEO_MODEL` — optional async Story Trailer provider model (defaults to `sora-2`)
+- `STORYVERSE_TRAILER_SECONDS` / `STORYVERSE_TRAILER_SIZE` — optional trailer duration (`4`, `8`, or `12`) and frame size; the default is an 8-second 1280×720 glimpse
 - `OPENAI_NARRATION_MODEL` — exact-text narration through `gpt-4o-mini-tts`
 - `STORYVERSE_DIRECTOR_TIMEOUT_MS` — optional bounded wait for the proposal-only AI Story Director pass (default `45000`)
 
@@ -50,7 +53,7 @@ StoryVerse now has a portable persistence boundary:
 
 - **Local/offline:** SQLite plus local generated-media files.
 - **Concurrent production traffic:** PostgreSQL with optimistic story-version writes, transactional timeline rollback, and cross-instance image-cache reservation.
-- **Databricks:** Lakebase PostgreSQL for transactional world state and a private Unity Catalog Volume for generated images and narration through the Databricks Files API.
+- **Databricks:** Lakebase PostgreSQL for transactional world state and a private Unity Catalog Volume for generated images, narration, and Story Trailer MP4s through the Databricks Files API.
 
 Set `DATABASE_URL` (or standard `PG*` values) to select PostgreSQL; otherwise SQLite remains the default. To move media into a Unity Catalog Volume, set `STORYVERSE_ASSET_STORAGE=databricks-volume`, `DATABRICKS_HOST`, `DATABRICKS_VOLUME_PATH`, and—preferably for production—managed-secret `DATABRICKS_CLIENT_ID` plus `DATABRICKS_CLIENT_SECRET`.
 
@@ -63,7 +66,9 @@ See [the deployment guide](docs/deployment.md) for local Docker PostgreSQL testi
 - `src/components/StoryExperience.tsx` — professional product home, use cases, World Atlas, and world-creation dialog.
 - `src/components/GeneratedWorldReader.tsx` — chapter reader, character perspective switcher, Director/direction/rollback controls, archive navigation, images, BGM, and narration controls.
 - `src/components/AIStoryDirector.tsx` — isolated review-before-apply Director panel for the current canonical chapter.
+- `src/components/StoryTrailer.tsx` — non-blocking last-chapter trailer control with accessible status and resilient polling.
 - `server/chapter-director.ts` — bounded structured-output Director agent with no world-aggregate context or write capability.
+- `server/story-trailer.ts` — async OpenAI video job orchestration, original-world trailer prompt construction, and private asset persistence.
 - `server/story-routes.ts` — chapter, perspective, Director proposal/apply, direction, and timeline-rollback APIs.
 - `server/persistence/` — PostgreSQL/Lakebase schema, migrations, optimistic concurrency, and the common local/remote store contract.
 - `server/storage/` — provider-neutral generated-media store with local filesystem and Databricks Unity Catalog Volume implementations.
@@ -91,5 +96,7 @@ StoryVerse currently supports linear, persistent chapter continuations per creat
 - `POST /api/worlds/:worldId/story/chapters/:chapterId/director/apply` — revalidate and atomically apply the reviewed proposal; stale proposals are rejected.
 - `DELETE /api/worlds/:worldId/story/chapters/:chapterId` — remove a latest non-initial chapter and return its prior surviving chapter.
 - `DELETE /api/worlds/:worldId/story/chapters/:chapterId/future` — retain the selected chapter and remove every later chapter.
+- `POST /api/worlds/:worldId/story/trailer` — explicitly start or resume a trailer for the newest canonical chapter; never starts automatically.
+- `GET /api/worlds/:worldId/story/trailer` — retrieve and refresh the persisted render status for the newest canonical chapter.
 
 The direction queue, Director-applied revisions, and timeline rollback are stored inside the local SQLite record or the PostgreSQL story aggregate. PostgreSQL rollback locks the story row and deletes corresponding `story_images` metadata in the same transaction. No client-side-only state is relied on, so a refresh preserves the resulting timeline.

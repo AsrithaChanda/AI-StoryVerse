@@ -1,6 +1,7 @@
 import { DatabaseSync } from "node:sqlite";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { generateWorld } from "./generation.js";
+import { toPublicStoryTrailer } from "./persistence/store.js";
 import { WorldStore } from "./worlds.js";
 
 function createWorld(store: WorldStore, title = "The Glass Horizon") {
@@ -36,18 +37,26 @@ describe("world archive", () => {
       characterIds: [], promptVersion: "test", prompt: "A test image.",
       fallbackUrl: "data:image/svg+xml;base64,",
     });
+    const reserveTrailer = (worldId: string) => store.reserveStoryTrailer({
+      cacheKey: `trailer-${worldId}`, worldId, chapterId: "chapter-1", chapterRevision: 1,
+      promptVersion: "test", prompt: "A concise trailer prompt that is never returned to a browser.",
+    });
     saveStory(target.id);
     saveStory(survivor.id);
     reserveImage(target.id);
     reserveImage(survivor.id);
+    reserveTrailer(target.id);
+    reserveTrailer(survivor.id);
 
     expect(store.deleteWorld(target.id)).toBe(true);
     expect(store.get(target.id)).toBeNull();
     expect(store.getWorldStory(target.id)).toBeNull();
     expect(store.findStoryImage(target.id, "chapter-1-beat-1")).toBeNull();
+    expect(store.findStoryTrailer(target.id, "chapter-1", 1)).toBeNull();
     expect(store.get(survivor.id)?.title).toBe("Keep Me");
     expect(store.getWorldStory(survivor.id)).not.toBeNull();
     expect(store.findStoryImage(survivor.id, "chapter-1-beat-1")).not.toBeNull();
+    expect(store.findStoryTrailer(survivor.id, "chapter-1", 1)).not.toBeNull();
     expect(store.deleteWorld("missing-world")).toBe(false);
   });
 
@@ -151,5 +160,74 @@ describe("world archive", () => {
     const world = createWorld(store, "State Archive");
     store.saveWorldStory({ worldId: world.id, characters: [], chapters: [], perspectives: [], source: "openai", createdAt: "2026-01-01T00:00:00.000Z", updatedAt: "2026-01-01T00:00:00.000Z", worldState: "A storm threatens Chandraka. Author direction: add thunder. Author direction: save Arin." });
     expect(store.getWorldStory(world.id)?.worldState).toBe("A storm threatens Chandraka.");
+  });
+
+  it("reserves one trailer per cache key and advances its durable render lifecycle", () => {
+    const store = new WorldStore(new DatabaseSync(":memory:"));
+    const world = createWorld(store, "Trailer Archive");
+    const input = {
+      cacheKey: "trailer-cache-key",
+      worldId: world.id,
+      chapterId: "chapter-1",
+      chapterRevision: 2,
+      promptVersion: "storyverse-trailer-v1",
+      prompt: "A server-only cinematic trailer prompt for the current story snapshot.",
+    };
+
+    const first = store.reserveStoryTrailer(input);
+    const duplicate = store.reserveStoryTrailer(input);
+    expect(first).toMatchObject({ created: true, trailer: { status: "queued", progress: 0, retryCount: 0 } });
+    expect(duplicate).toMatchObject({ created: false, trailer: { id: first.trailer.id } });
+    const publicTrailer = toPublicStoryTrailer(first.trailer);
+    expect(publicTrailer).not.toHaveProperty("prompt");
+    expect(publicTrailer).not.toHaveProperty("providerJobId");
+    expect(publicTrailer).not.toHaveProperty("cacheKey");
+
+    expect(store.markStoryTrailerQueued(input.cacheKey, {
+      provider: "sora-2", providerJobId: "video_123", status: "in_progress", progress: 18,
+    })).toMatchObject({ status: "in_progress", progress: 18, providerJobId: "video_123" });
+    expect(store.markStoryTrailerProgress(input.cacheKey, 63.7, "in_progress"))
+      .toMatchObject({ status: "in_progress", progress: 64 });
+    expect(store.markStoryTrailerReady(input.cacheKey, {
+      videoUrl: "/api/worlds/trailer/content", provider: "sora-2", providerAssetId: "volumes/path/trailer.mp4",
+    })).toMatchObject({ status: "ready", progress: 100, videoUrl: "/api/worlds/trailer/content" });
+
+    // A stale provider poll must not turn a completed trailer back into a pending one.
+    expect(store.markStoryTrailerProgress(input.cacheKey, 30, "in_progress"))
+      .toMatchObject({ status: "ready", progress: 100 });
+
+    const failedInput = { ...input, cacheKey: "failed-trailer-cache-key", chapterRevision: 1 };
+    store.reserveStoryTrailer(failedInput);
+    expect(store.markStoryTrailerFailed(failedInput.cacheKey, "provider_error"))
+      .toMatchObject({ status: "failed", errorCode: "provider_error", retryCount: 1 });
+    expect(store.requeueFailedStoryTrailer(failedInput.cacheKey))
+      .toMatchObject({ requeued: true, trailer: { status: "queued", progress: 0, errorCode: undefined, retryCount: 2, providerJobId: undefined } });
+    expect(store.requeueFailedStoryTrailer(failedInput.cacheKey))
+      .toMatchObject({ requeued: false, trailer: { status: "queued", retryCount: 2 } });
+  });
+
+  it("removes only trailers for rolled-back future chapters", () => {
+    const store = new WorldStore(new DatabaseSync(":memory:"));
+    const world = createWorld(store, "Trailer Timeline");
+    store.saveWorldStory({
+      worldId: world.id,
+      characters: [],
+      perspectives: [],
+      worldState: "The first chapter remains the canonical point after the future is removed.",
+      source: "fallback",
+      createdAt: "2026-07-26T10:00:00.000Z",
+      updatedAt: "2026-07-26T10:00:00.000Z",
+      chapters: [
+        { id: "chapter-1", number: 1, title: "First", narration: "The first chapter ends with a clear handoff into the second.", beats: [] },
+        { id: "chapter-2", number: 2, title: "Second", narration: "The second chapter is eligible for a trailer until it is removed.", beats: [] },
+      ],
+    });
+    store.reserveStoryTrailer({ cacheKey: "trailer-first", worldId: world.id, chapterId: "chapter-1", chapterRevision: 1, promptVersion: "v1", prompt: "First trailer." });
+    store.reserveStoryTrailer({ cacheKey: "trailer-second", worldId: world.id, chapterId: "chapter-2", chapterRevision: 1, promptVersion: "v1", prompt: "Second trailer." });
+
+    const result = store.deleteFutureChapters(world.id, "chapter-1");
+    expect(result).toMatchObject({ ok: true, value: { removedChapterIds: ["chapter-2"] } });
+    expect(store.findStoryTrailer(world.id, "chapter-1", 1)).not.toBeNull();
+    expect(store.findStoryTrailer(world.id, "chapter-2", 1)).toBeNull();
   });
 });

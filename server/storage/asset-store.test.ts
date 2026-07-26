@@ -49,6 +49,15 @@ describe("LocalAssetStore", () => {
     expect(await store.exists("images/world-1/missing.png")).toBe(false);
   });
 
+  it("identifies persisted MP4 trailers when the asset backend reads them later", async () => {
+    const { store } = await localStore();
+    await store.put("trailers/world-1/chapter-1.mp4", new Uint8Array([0, 0, 0, 24]), "video/mp4");
+
+    await expect(store.read("trailers/world-1/chapter-1.mp4")).resolves.toMatchObject({
+      contentType: "video/mp4",
+    });
+  });
+
   it("rejects traversal and encoded separator keys before touching storage", async () => {
     const { store } = await localStore();
     for (const key of ["../outside.png", "/absolute.png", "images/../outside.png", "images\\outside.png", "images/%2e%2e/outside.png", "images//outside.png"]) {

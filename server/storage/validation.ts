@@ -43,6 +43,7 @@ export function contentTypeForKey(key: string): string {
     mp3: "audio/mpeg",
     ogg: "audio/ogg",
     m4a: "audio/mp4",
+    mp4: "video/mp4",
   })[extension ?? ""] ?? "application/octet-stream";
 }
 

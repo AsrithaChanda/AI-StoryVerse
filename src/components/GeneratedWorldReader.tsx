@@ -16,6 +16,7 @@ import type { AudioPlan } from "../audio/chapter-audio";
 import SceneImage, { type SceneImageRequest } from "./SceneImage";
 import StoryAuthorControls from "./StoryAuthorControls";
 import StoryGenerationStage, { type StoryIllustrationProgress } from "./StoryGenerationStage";
+import StoryTrailer from "./StoryTrailer";
 import WorldCast from "./WorldCast";
 import { buildStoryFlow } from "../story-layout";
 import "../styles/chapter-handoff.css";
@@ -502,6 +503,14 @@ export default function GeneratedWorldReader({ world, close }: { world: World; c
                 busy={busy || Boolean(illustrationProgress)}
                 onPropose={proposeDirectorChange}
                 onApply={applyDirectorChange}
+              />}
+              {isLatestChapter && isCanonicalReading && <StoryTrailer
+                key={`${world.id}-${chapterArtifactKey}-${story.chapters.length}`}
+                worldId={world.id}
+                chapterId={chapter.id}
+                chapterRevision={chapter.revision ?? 1}
+                chapterCount={story.chapters.length}
+                disabled={busy || Boolean(illustrationProgress)}
               />}
             </>}
             {isLatestChapter ? <StoryAuthorControls upcomingDirections={story.upcomingDirections ?? []} busy={busy || Boolean(illustrationProgress)} onAddDirection={(direction) => void addDirection(direction)} onGenerateNext={() => void advance()} /> : <div className="archive-note"><span>ARCHIVED CHAPTER</span><p>This chapter and its illustrations are preserved. Return to the latest chapter to continue the world’s timeline.</p><button type="button" onClick={() => showNarratorChapter(story.chapters.at(-1)!)}>Return to latest chapter →</button></div>}

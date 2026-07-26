@@ -16,6 +16,11 @@ import {
 } from "../storage/databricks-volume-asset-store.js";
 import { POSTGRES_MIGRATIONS_TABLE, POSTGRES_SCHEMA_MIGRATIONS } from "./schema.js";
 import type {
+  NewStoryTrailer,
+  StoredStoryTrailer,
+  StoryTrailerReservation,
+  StoryTrailerRetryReservation,
+  StoryTrailerStatus,
   StoryImageReservation,
   StoryWriteOptions,
   VersionedStoryStore,
@@ -197,6 +202,26 @@ type StoryImageRow = Record<string, unknown> & {
   updated_at: string | Date;
 };
 
+type StoryTrailerRow = Record<string, unknown> & {
+  id: string;
+  cache_key: string;
+  world_id: string;
+  chapter_id: string;
+  chapter_revision: number | string;
+  prompt_version: string;
+  prompt: string;
+  status: StoryTrailerStatus;
+  progress: number | string;
+  video_url: string | null;
+  provider: string | null;
+  provider_job_id: string | null;
+  provider_asset_id: string | null;
+  error_code: string | null;
+  retry_count: number | string;
+  created_at: string | Date;
+  updated_at: string | Date;
+};
+
 function toIso(value: string | Date | undefined, fallback: string): string {
   if (value instanceof Date) return value.toISOString();
   if (typeof value === "string" && value.length > 0) return value;
@@ -246,6 +271,28 @@ function rowToStoryImage(row: StoryImageRow): StoredStoryImage {
     imageUrl: row.image_url ?? undefined,
     fallbackUrl: row.fallback_url,
     provider: row.provider ?? undefined,
+    providerAssetId: row.provider_asset_id ?? undefined,
+    errorCode: row.error_code ?? undefined,
+    retryCount: Number(row.retry_count),
+    createdAt: toIso(row.created_at, new Date(0).toISOString()),
+    updatedAt: toIso(row.updated_at, new Date(0).toISOString()),
+  };
+}
+
+function rowToStoryTrailer(row: StoryTrailerRow): StoredStoryTrailer {
+  return {
+    id: row.id,
+    cacheKey: row.cache_key,
+    worldId: row.world_id,
+    chapterId: row.chapter_id,
+    chapterRevision: Number(row.chapter_revision),
+    promptVersion: row.prompt_version,
+    prompt: row.prompt,
+    status: row.status,
+    progress: Number(row.progress),
+    videoUrl: row.video_url ?? undefined,
+    provider: row.provider ?? undefined,
+    providerJobId: row.provider_job_id ?? undefined,
     providerAssetId: row.provider_asset_id ?? undefined,
     errorCode: row.error_code ?? undefined,
     retryCount: Number(row.retry_count),
@@ -669,6 +716,7 @@ export class PostgresWorldStore implements VersionedStoryStore {
       updatedAt: this.now().toISOString(),
     };
     await this.deleteStoryImagesForChapters(client, updated.worldId, removedChapterIds);
+    await this.deleteStoryTrailersForChapters(client, updated.worldId, removedChapterIds);
     const persisted = await this.saveWorldStoryInTransaction(client, updated, record.version);
     if (!persisted) throw new Error("Story changed while chapter rollback was being committed");
     return { story: persisted, chapter: persisted.chapters.at(-1)!, removedChapterIds };
@@ -684,6 +732,13 @@ export class PostgresWorldStore implements VersionedStoryStore {
       chapterIds,
       chapterIds.map((chapterId) => `${chapterId}-%`),
     ]);
+  }
+
+  /** Trailer rows are owned by canonical chapter IDs, independent of scene namespaces. */
+  private async deleteStoryTrailersForChapters(client: PgClient, worldId: string, chapterIds: string[]): Promise<void> {
+    if (chapterIds.length === 0) return;
+    await client.query(`DELETE FROM story_trailers
+      WHERE world_id = $1 AND chapter_id = ANY($2::text[])`, [worldId, chapterIds]);
   }
 
   private async saveWorldStoryInTransaction(
@@ -805,11 +860,135 @@ export class PostgresWorldStore implements VersionedStoryStore {
       WHERE cache_key = $1 AND status = 'failed' AND retry_count < 2 RETURNING *`, [cacheKey, this.now().toISOString()]);
   }
 
+  /** Uses the same database uniqueness guard as images to avoid duplicate video jobs. */
+  public async reserveStoryTrailer(input: NewStoryTrailer): Promise<StoryTrailerReservation> {
+    await this.ready();
+    const timestamp = this.now().toISOString();
+    const trailer: StoredStoryTrailer = {
+      id: this.createId(),
+      ...input,
+      status: "queued",
+      progress: 0,
+      retryCount: 0,
+      createdAt: timestamp,
+      updatedAt: timestamp,
+    };
+    const inserted = await this.pool.query<StoryTrailerRow>(`INSERT INTO story_trailers (
+      id, cache_key, world_id, chapter_id, chapter_revision, prompt_version, prompt,
+      status, progress, video_url, provider, provider_job_id, provider_asset_id,
+      error_code, retry_count, created_at, updated_at
+    ) VALUES (
+      $1, $2, $3, $4, $5, $6, $7, $8, $9, NULL, NULL, NULL, NULL, NULL, $10, $11, $12
+    ) ON CONFLICT (cache_key) DO NOTHING RETURNING *`, [
+      trailer.id, trailer.cacheKey, trailer.worldId, trailer.chapterId, trailer.chapterRevision,
+      trailer.promptVersion, trailer.prompt, trailer.status, trailer.progress, trailer.retryCount,
+      trailer.createdAt, trailer.updatedAt,
+    ]);
+    if (inserted.rows[0]) return { trailer: rowToStoryTrailer(inserted.rows[0]), created: true };
+
+    const existing = await this.getStoryTrailerByCacheKey(input.cacheKey)
+      ?? await this.getStoryTrailerByCacheKey(input.cacheKey);
+    if (!existing) throw new Error("Trailer reservation conflicted but no cache record was readable");
+    return { trailer: existing, created: false };
+  }
+
+  public async getStoryTrailerByCacheKey(cacheKey: string): Promise<StoredStoryTrailer | null> {
+    await this.ready();
+    const result = await this.pool.query<StoryTrailerRow>("SELECT * FROM story_trailers WHERE cache_key = $1", [cacheKey]);
+    return result.rows[0] ? rowToStoryTrailer(result.rows[0]) : null;
+  }
+
+  public async findStoryTrailer(
+    worldId: string,
+    chapterId: string,
+    chapterRevision: number,
+  ): Promise<StoredStoryTrailer | null> {
+    await this.ready();
+    const result = await this.pool.query<StoryTrailerRow>(`SELECT * FROM story_trailers
+      WHERE world_id = $1 AND chapter_id = $2 AND chapter_revision = $3
+      ORDER BY updated_at DESC LIMIT 1`, [worldId, chapterId, chapterRevision]);
+    return result.rows[0] ? rowToStoryTrailer(result.rows[0]) : null;
+  }
+
+  public async markStoryTrailerQueued(
+    cacheKey: string,
+    result: { provider: string; providerJobId: string; providerAssetId?: string; status?: "queued" | "in_progress"; progress?: number },
+  ): Promise<StoredStoryTrailer | null> {
+    return this.updateStoryTrailer(`UPDATE story_trailers
+      SET status = $2, progress = $3, provider = $4, provider_job_id = $5, provider_asset_id = $6,
+        error_code = NULL, updated_at = $7
+      WHERE cache_key = $1 AND status IN ('queued', 'in_progress') RETURNING *`, [
+      cacheKey, result.status ?? "queued", normalizeTrailerProgress(result.progress, 0), result.provider,
+      result.providerJobId, result.providerAssetId ?? null, this.now().toISOString(),
+    ]);
+  }
+
+  public async markStoryTrailerProgress(
+    cacheKey: string,
+    progress: number,
+    status: "queued" | "in_progress",
+  ): Promise<StoredStoryTrailer | null> {
+    return this.updateStoryTrailer(`UPDATE story_trailers
+      SET status = $2, progress = $3, updated_at = $4
+      WHERE cache_key = $1 AND status IN ('queued', 'in_progress') RETURNING *`, [
+      cacheKey, status, normalizeTrailerProgress(progress, 0), this.now().toISOString(),
+    ]);
+  }
+
+  public async markStoryTrailerReady(
+    cacheKey: string,
+    result: { videoUrl: string; provider: string; providerAssetId?: string },
+  ): Promise<StoredStoryTrailer | null> {
+    return this.updateStoryTrailer(`UPDATE story_trailers
+      SET status = 'ready', progress = 100, video_url = $2, provider = $3, provider_asset_id = $4,
+        error_code = NULL, updated_at = $5
+      WHERE cache_key = $1 AND status IN ('queued', 'in_progress') RETURNING *`, [
+      cacheKey, result.videoUrl, result.provider, result.providerAssetId ?? null, this.now().toISOString(),
+    ]);
+  }
+
+  public async markStoryTrailerFailed(cacheKey: string, errorCode: string): Promise<StoredStoryTrailer | null> {
+    return this.updateStoryTrailer(`UPDATE story_trailers
+      SET status = 'failed', error_code = $2, retry_count = retry_count + 1, updated_at = $3
+      WHERE cache_key = $1 AND status IN ('queued', 'in_progress') RETURNING *`, [cacheKey, errorCode, this.now().toISOString()]);
+  }
+
+  /**
+   * `RETURNING` distinguishes the one request that atomically changed
+   * failed→queued from concurrent retry requests. Only that winner may create
+   * a new provider job.
+   */
+  public async requeueFailedStoryTrailer(cacheKey: string): Promise<StoryTrailerRetryReservation | null> {
+    await this.ready();
+    const updated = await this.pool.query<StoryTrailerRow>(`UPDATE story_trailers
+      SET status = 'queued', progress = 0, video_url = NULL, provider = NULL, provider_job_id = NULL,
+        provider_asset_id = NULL, error_code = NULL, retry_count = retry_count + 1, updated_at = $2
+      WHERE cache_key = $1 AND status = 'failed' RETURNING *`, [cacheKey, this.now().toISOString()]);
+    if (updated.rows[0]) return { trailer: rowToStoryTrailer(updated.rows[0]), requeued: true };
+
+    // Another request may have won the transition between this request's
+    // intent and UPDATE. Return its current durable state without authorizing
+    // another provider call.
+    const trailer = await this.getStoryTrailerByCacheKey(cacheKey);
+    return trailer ? { trailer, requeued: false } : null;
+  }
+
   private async updateStoryImage(sql: string, values: readonly unknown[]): Promise<StoredStoryImage | null> {
     await this.ready();
     const result = await this.pool.query<StoryImageRow>(sql, values);
     return result.rows[0] ? rowToStoryImage(result.rows[0]) : null;
   }
+
+  private async updateStoryTrailer(sql: string, values: readonly unknown[]): Promise<StoredStoryTrailer | null> {
+    await this.ready();
+    const result = await this.pool.query<StoryTrailerRow>(sql, values);
+    return result.rows[0] ? rowToStoryTrailer(result.rows[0]) : null;
+  }
+}
+
+function normalizeTrailerProgress(value: number | undefined, fallback: number): number {
+  if (typeof value !== "number" || !Number.isFinite(value)) return fallback;
+  return Math.max(0, Math.min(100, Math.round(value)));
 }
 
 /** Keep imported deletion types visible to consumers of this module. */

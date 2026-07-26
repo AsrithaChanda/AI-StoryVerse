@@ -1,6 +1,12 @@
 import { randomUUID } from "node:crypto";
 import { DatabaseSync } from "node:sqlite";
 import type { NewStoryImage, StoredStoryImage } from "./images/types.js";
+import type {
+  NewStoryTrailer,
+  StoredStoryTrailer,
+  StoryTrailerRetryReservation,
+  StoryTrailerStatus,
+} from "./persistence/store.js";
 import { MAX_UPCOMING_DIRECTIONS, type StoryChapter, type WorldStory } from "./story.js";
 
 export type World = {
@@ -69,6 +75,28 @@ export class WorldStore {
       FOREIGN KEY(world_id) REFERENCES worlds(id)
     )`);
     db.exec("CREATE INDEX IF NOT EXISTS story_images_scene_idx ON story_images(world_id, scene_id)");
+    db.exec(`CREATE TABLE IF NOT EXISTS story_trailers (
+      id TEXT PRIMARY KEY,
+      cache_key TEXT NOT NULL UNIQUE,
+      world_id TEXT NOT NULL,
+      chapter_id TEXT NOT NULL,
+      chapter_revision INTEGER NOT NULL,
+      prompt_version TEXT NOT NULL,
+      prompt TEXT NOT NULL,
+      status TEXT NOT NULL,
+      progress INTEGER NOT NULL DEFAULT 0,
+      video_url TEXT,
+      provider TEXT,
+      provider_job_id TEXT,
+      provider_asset_id TEXT,
+      error_code TEXT,
+      retry_count INTEGER NOT NULL DEFAULT 0,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL,
+      FOREIGN KEY(world_id) REFERENCES worlds(id)
+    )`);
+    db.exec("CREATE INDEX IF NOT EXISTS story_trailers_lookup_idx ON story_trailers(world_id, chapter_id, chapter_revision, updated_at DESC)");
+    db.exec("CREATE INDEX IF NOT EXISTS story_trailers_status_idx ON story_trailers(status, updated_at DESC)");
     db.exec(`CREATE TABLE IF NOT EXISTS world_stories (
       world_id TEXT PRIMARY KEY,
       story_json TEXT NOT NULL,
@@ -109,6 +137,7 @@ export class WorldStore {
   /** Deletes the relational records for one known world; callers own the transaction. */
   private deleteWorldRecords(worldId: string): void {
     this.db.prepare("DELETE FROM story_images WHERE world_id = ?").run(worldId);
+    this.db.prepare("DELETE FROM story_trailers WHERE world_id = ?").run(worldId);
     this.db.prepare("DELETE FROM world_stories WHERE world_id = ?").run(worldId);
     this.db.prepare("DELETE FROM worlds WHERE id = ?").run(worldId);
   }
@@ -237,6 +266,7 @@ export class WorldStore {
       characters: story.characters.filter((character) => !removedIds.has(character.introducedInChapter ?? "chapter-1")),
     };
     this.deleteStoryImagesForChapters(story.worldId, removedChapterIds);
+    this.deleteStoryTrailersForChapters(story.worldId, removedChapterIds);
     const persisted = this.saveWorldStory(updated);
     const chapter = persisted.chapters.at(-1);
     if (!chapter) throw new Error("Chapter deletion removed every chapter");
@@ -251,6 +281,13 @@ export class WorldStore {
   private deleteStoryImagesForChapters(worldId: string, chapterIds: string[]): void {
     const statement = this.db.prepare("DELETE FROM story_images WHERE world_id = ? AND (scene_id = ? OR scene_id LIKE ?)");
     for (const chapterId of chapterIds) statement.run(worldId, chapterId, `${chapterId}-%`);
+  }
+
+  /** Trailer records are snapshots of one canonical chapter revision. */
+  private deleteStoryTrailersForChapters(worldId: string, chapterIds: string[]): void {
+    if (chapterIds.length === 0) return;
+    const statement = this.db.prepare("DELETE FROM story_trailers WHERE world_id = ? AND chapter_id = ?");
+    for (const chapterId of chapterIds) statement.run(worldId, chapterId);
   }
 
   public visualBeat(worldId: string, sceneId: string): string | null {
@@ -354,6 +391,118 @@ export class WorldStore {
     return this.getStoryImageByCacheKey(cacheKey);
   }
 
+  /**
+   * Atomically reserves one trailer render for a canonical chapter revision.
+   * The unique cache key prevents double-clicks and multiple app instances
+   * from starting duplicate paid video jobs.
+   */
+  public reserveStoryTrailer(input: NewStoryTrailer): { trailer: StoredStoryTrailer; created: boolean } {
+    const existing = this.getStoryTrailerByCacheKey(input.cacheKey);
+    if (existing) return { trailer: existing, created: false };
+    const now = new Date().toISOString();
+    const trailer: StoredStoryTrailer = {
+      id: randomUUID(),
+      ...input,
+      status: "queued",
+      progress: 0,
+      retryCount: 0,
+      createdAt: now,
+      updatedAt: now,
+    };
+    try {
+      this.db.prepare(`INSERT INTO story_trailers (
+        id, cache_key, world_id, chapter_id, chapter_revision, prompt_version,
+        prompt, status, progress, video_url, provider, provider_job_id,
+        provider_asset_id, error_code, retry_count, created_at, updated_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+        .run(
+          trailer.id, trailer.cacheKey, trailer.worldId, trailer.chapterId,
+          trailer.chapterRevision, trailer.promptVersion, trailer.prompt, trailer.status,
+          trailer.progress, null, null, null, null, null, trailer.retryCount,
+          trailer.createdAt, trailer.updatedAt,
+        );
+      return { trailer, created: true };
+    } catch (error) {
+      const raced = this.getStoryTrailerByCacheKey(input.cacheKey);
+      if (raced) return { trailer: raced, created: false };
+      throw error;
+    }
+  }
+
+  public getStoryTrailerByCacheKey(cacheKey: string): StoredStoryTrailer | null {
+    const row = this.db.prepare("SELECT * FROM story_trailers WHERE cache_key = ?").get(cacheKey) as unknown as StoryTrailerRow | undefined;
+    return row ? rowToStoryTrailer(row) : null;
+  }
+
+  public findStoryTrailer(worldId: string, chapterId: string, chapterRevision: number): StoredStoryTrailer | null {
+    const row = this.db.prepare(`SELECT * FROM story_trailers
+      WHERE world_id = ? AND chapter_id = ? AND chapter_revision = ?
+      ORDER BY updated_at DESC LIMIT 1`)
+      .get(worldId, chapterId, chapterRevision) as unknown as StoryTrailerRow | undefined;
+    return row ? rowToStoryTrailer(row) : null;
+  }
+
+  public markStoryTrailerQueued(
+    cacheKey: string,
+    result: { provider: string; providerJobId: string; providerAssetId?: string; status?: "queued" | "in_progress"; progress?: number },
+  ): StoredStoryTrailer | null {
+    const status = result.status ?? "queued";
+    const progress = normalizeTrailerProgress(result.progress, 0);
+    this.db.prepare(`UPDATE story_trailers
+      SET status = ?, progress = ?, provider = ?, provider_job_id = ?, provider_asset_id = ?,
+        error_code = NULL, updated_at = ?
+      WHERE cache_key = ? AND status IN ('queued', 'in_progress')`)
+      .run(status, progress, result.provider, result.providerJobId, result.providerAssetId ?? null, new Date().toISOString(), cacheKey);
+    return this.getStoryTrailerByCacheKey(cacheKey);
+  }
+
+  public markStoryTrailerProgress(
+    cacheKey: string,
+    progress: number,
+    status: "queued" | "in_progress",
+  ): StoredStoryTrailer | null {
+    this.db.prepare(`UPDATE story_trailers
+      SET status = ?, progress = ?, updated_at = ?
+      WHERE cache_key = ? AND status IN ('queued', 'in_progress')`)
+      .run(status, normalizeTrailerProgress(progress, 0), new Date().toISOString(), cacheKey);
+    return this.getStoryTrailerByCacheKey(cacheKey);
+  }
+
+  public markStoryTrailerReady(
+    cacheKey: string,
+    result: { videoUrl: string; provider: string; providerAssetId?: string },
+  ): StoredStoryTrailer | null {
+    this.db.prepare(`UPDATE story_trailers
+      SET status = 'ready', progress = 100, video_url = ?, provider = ?, provider_asset_id = ?,
+        error_code = NULL, updated_at = ?
+      WHERE cache_key = ? AND status IN ('queued', 'in_progress')`)
+      .run(result.videoUrl, result.provider, result.providerAssetId ?? null, new Date().toISOString(), cacheKey);
+    return this.getStoryTrailerByCacheKey(cacheKey);
+  }
+
+  public markStoryTrailerFailed(cacheKey: string, errorCode: string): StoredStoryTrailer | null {
+    this.db.prepare(`UPDATE story_trailers
+      SET status = 'failed', error_code = ?, retry_count = retry_count + 1, updated_at = ?
+      WHERE cache_key = ? AND status IN ('queued', 'in_progress')`)
+      .run(errorCode, new Date().toISOString(), cacheKey);
+    return this.getStoryTrailerByCacheKey(cacheKey);
+  }
+
+  /**
+   * A failed trailer may be retried without creating another cache record.
+   * SQLite's affected-row count makes the retry winner explicit, so a second
+   * simultaneous browser click cannot start another paid render.
+   */
+  public requeueFailedStoryTrailer(cacheKey: string): StoryTrailerRetryReservation | null {
+    const result = this.db.prepare(`UPDATE story_trailers
+      SET status = 'queued', progress = 0, video_url = NULL, provider = NULL, provider_job_id = NULL,
+        provider_asset_id = NULL, error_code = NULL, retry_count = retry_count + 1, updated_at = ?
+      WHERE cache_key = ? AND status = 'failed'`)
+      .run(new Date().toISOString(), cacheKey);
+    const trailer = this.getStoryTrailerByCacheKey(cacheKey);
+    return trailer ? { trailer, requeued: result.changes > 0 } : null;
+  }
+
 }
 
 type StoryImageRow = {
@@ -362,6 +511,14 @@ type StoryImageRow = {
   status: StoredStoryImage["status"]; image_url: string | null; fallback_url: string;
   provider: string | null; provider_asset_id: string | null; error_code: string | null;
   retry_count: number; created_at: string; updated_at: string;
+};
+
+type StoryTrailerRow = {
+  id: string; cache_key: string; world_id: string; chapter_id: string;
+  chapter_revision: number; prompt_version: string; prompt: string;
+  status: StoryTrailerStatus; progress: number; video_url: string | null;
+  provider: string | null; provider_job_id: string | null; provider_asset_id: string | null;
+  error_code: string | null; retry_count: number; created_at: string; updated_at: string;
 };
 
 
@@ -453,6 +610,33 @@ function rowToStoryImage(row: StoryImageRow): StoredStoryImage {
     providerAssetId: row.provider_asset_id ?? undefined, errorCode: row.error_code ?? undefined,
     retryCount: row.retry_count, createdAt: row.created_at, updatedAt: row.updated_at,
   };
+}
+
+function rowToStoryTrailer(row: StoryTrailerRow): StoredStoryTrailer {
+  return {
+    id: row.id,
+    cacheKey: row.cache_key,
+    worldId: row.world_id,
+    chapterId: row.chapter_id,
+    chapterRevision: row.chapter_revision,
+    promptVersion: row.prompt_version,
+    prompt: row.prompt,
+    status: row.status,
+    progress: row.progress,
+    videoUrl: row.video_url ?? undefined,
+    provider: row.provider ?? undefined,
+    providerJobId: row.provider_job_id ?? undefined,
+    providerAssetId: row.provider_asset_id ?? undefined,
+    errorCode: row.error_code ?? undefined,
+    retryCount: row.retry_count,
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
+  };
+}
+
+function normalizeTrailerProgress(value: number | undefined, fallback: number): number {
+  if (typeof value !== "number" || !Number.isFinite(value)) return fallback;
+  return Math.max(0, Math.min(100, Math.round(value)));
 }
 
 function slug(value: string): string {

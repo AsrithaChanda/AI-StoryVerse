@@ -115,6 +115,29 @@ function imageRow(overrides: Partial<Record<string, unknown>> = {}): Record<stri
   };
 }
 
+function trailerRow(overrides: Partial<Record<string, unknown>> = {}): Record<string, unknown> {
+  return {
+    id: "trailer-1",
+    cache_key: "trailer-key",
+    world_id: "world-1",
+    chapter_id: "chapter-3",
+    chapter_revision: 1,
+    prompt_version: "storyverse-trailer-v1",
+    prompt: "A private trailer prompt that must not leave the server.",
+    status: "queued",
+    progress: 0,
+    video_url: null,
+    provider: null,
+    provider_job_id: null,
+    provider_asset_id: null,
+    error_code: null,
+    retry_count: 0,
+    created_at: "2026-07-26T10:00:00.000Z",
+    updated_at: "2026-07-26T10:00:00.000Z",
+    ...overrides,
+  };
+}
+
 describe("PostgresWorldStore configuration", () => {
   it("keeps the existing synchronous SQLite store assignable to the async-capable contract", () => {
     const sqlite: StoryStore = new WorldStore(new DatabaseSync(":memory:"));
@@ -223,6 +246,7 @@ describe("PostgresWorldStore migrations", () => {
     expect(pool.calls.some((call) => includes(call, "CREATE TABLE IF NOT EXISTS worlds"))).toBe(true);
     expect(pool.calls.some((call) => includes(call, "CREATE TABLE IF NOT EXISTS world_stories"))).toBe(true);
     expect(pool.calls.some((call) => includes(call, "CREATE TABLE IF NOT EXISTS story_images"))).toBe(true);
+    expect(pool.calls.some((call) => includes(call, "CREATE TABLE IF NOT EXISTS story_trailers"))).toBe(true);
     expect(pool.releases).toBe(1);
   });
 
@@ -279,8 +303,11 @@ describe("PostgresWorldStore story concurrency and rollback", () => {
 
     const imageDelete = pool.calls.find((call) => includes(call, "DELETE FROM story_images"));
     expect(imageDelete?.values).toEqual(["world-1", ["chapter-2", "chapter-3"], ["chapter-2-%", "chapter-3-%"]]);
+    const trailerDelete = pool.calls.find((call) => includes(call, "DELETE FROM story_trailers"));
+    expect(trailerDelete?.values).toEqual(["world-1", ["chapter-2", "chapter-3"]]);
     const ordered = pool.calls.map((call) => call.text);
     expect(ordered.findIndex((text) => text.includes("DELETE FROM story_images"))).toBeLessThan(ordered.findIndex((text) => text.includes("UPDATE world_stories")));
+    expect(ordered.findIndex((text) => text.includes("DELETE FROM story_trailers"))).toBeLessThan(ordered.findIndex((text) => text.includes("UPDATE world_stories")));
     expect(ordered.at(-1)).toBe("COMMIT");
   });
 
@@ -341,6 +368,77 @@ describe("PostgresWorldStore image cache", () => {
     const reserved = await store.reserveStoryImage(input);
     expect(reserved.created).toBe(true);
     expect(reserved.image).toMatchObject({ status: "pending", cacheKey: "image-key" });
+  });
+});
+
+describe("PostgresWorldStore trailer cache", () => {
+  it("uses INSERT ON CONFLICT for cross-instance trailer reservations and returns the existing render", async () => {
+    const existing = trailerRow({ status: "ready", progress: 100, video_url: "/api/worlds/world-1/trailer/content", provider: "sora-2" });
+    const pool = new RecordingPool((call) => {
+      if (includes(call, "INSERT INTO story_trailers")) return { rows: [], rowCount: 0 };
+      if (includes(call, "SELECT * FROM story_trailers WHERE cache_key")) return { rows: [existing], rowCount: 1 };
+      return { rows: [], rowCount: 0 };
+    });
+    const store = await initializedStore(pool);
+    const reserved = await store.reserveStoryTrailer({
+      cacheKey: "trailer-key", worldId: "world-1", chapterId: "chapter-3", chapterRevision: 1,
+      promptVersion: "storyverse-trailer-v1", prompt: "A private trailer prompt that must not leave the server.",
+    });
+
+    expect(reserved).toMatchObject({ created: false, trailer: { status: "ready", progress: 100, videoUrl: "/api/worlds/world-1/trailer/content" } });
+    expect(pool.calls.find((call) => includes(call, "INSERT INTO story_trailers"))?.text)
+      .toContain("ON CONFLICT (cache_key) DO NOTHING RETURNING *");
+  });
+
+  it("persists queued job metadata, progress, ready media, and retry state without stale progress overwriting ready", async () => {
+    const pool = new RecordingPool((call) => {
+      if (includes(call, "UPDATE story_trailers")) {
+        const isReady = includes(call, "status = 'ready'");
+        const isRetry = includes(call, "status = 'queued'") && includes(call, "provider_job_id = NULL");
+        return {
+          rows: [trailerRow({
+            status: isReady ? "ready" : isRetry ? "queued" : "in_progress",
+            progress: isReady ? 100 : isRetry ? 0 : 47,
+            video_url: isReady ? "/api/worlds/world-1/trailer/content" : null,
+            provider: isRetry ? null : "sora-2",
+            provider_job_id: isRetry ? null : "video_123",
+            retry_count: isRetry ? 2 : 0,
+          })],
+          rowCount: 1,
+        };
+      }
+      return { rows: [], rowCount: 0 };
+    });
+    const store = await initializedStore(pool);
+
+    await expect(store.markStoryTrailerQueued("trailer-key", {
+      provider: "sora-2", providerJobId: "video_123", status: "in_progress", progress: 12,
+    })).resolves.toMatchObject({ status: "in_progress", providerJobId: "video_123" });
+    await expect(store.markStoryTrailerProgress("trailer-key", 47, "in_progress"))
+      .resolves.toMatchObject({ status: "in_progress", progress: 47 });
+    await expect(store.markStoryTrailerReady("trailer-key", {
+      videoUrl: "/api/worlds/world-1/trailer/content", provider: "sora-2", providerAssetId: "volumes/trailer.mp4",
+    })).resolves.toMatchObject({ status: "ready", progress: 100 });
+    await expect(store.requeueFailedStoryTrailer("trailer-key"))
+      .resolves.toMatchObject({ requeued: true, trailer: { status: "queued", progress: 0, retryCount: 2 } });
+
+    const progressUpdate = pool.calls.find((call) => includes(call, "SET status = $2, progress = $3"));
+    expect(progressUpdate?.text).toContain("status IN ('queued', 'in_progress')");
+    expect(pool.calls.some((call) => includes(call, "provider_job_id = NULL"))).toBe(true);
+  });
+
+  it("does not authorize a second provider retry when another request already requeued the trailer", async () => {
+    const current = trailerRow({ status: "queued", progress: 0, provider: "sora-2", provider_job_id: "video_123", retry_count: 2 });
+    const pool = new RecordingPool((call) => {
+      if (includes(call, "UPDATE story_trailers")) return { rows: [], rowCount: 0 };
+      if (includes(call, "SELECT * FROM story_trailers WHERE cache_key")) return { rows: [current], rowCount: 1 };
+      return { rows: [], rowCount: 0 };
+    });
+    const store = await initializedStore(pool);
+
+    await expect(store.requeueFailedStoryTrailer("trailer-key"))
+      .resolves.toMatchObject({ requeued: false, trailer: { status: "queued", providerJobId: "video_123", retryCount: 2 } });
+    expect(pool.calls.some((call) => includes(call, "WHERE cache_key = $1 AND status = 'failed' RETURNING *"))).toBe(true);
   });
 });
 

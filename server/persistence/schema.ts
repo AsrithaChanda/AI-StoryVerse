@@ -52,6 +52,32 @@ export const POSTGRES_SCHEMA_MIGRATIONS = [
       "CREATE INDEX IF NOT EXISTS story_images_status_idx ON story_images(status, updated_at DESC)",
     ],
   },
+  {
+    id: "002_story_trailers",
+    statements: [
+      `CREATE TABLE IF NOT EXISTS story_trailers (
+        id TEXT PRIMARY KEY,
+        cache_key TEXT NOT NULL UNIQUE,
+        world_id TEXT NOT NULL REFERENCES worlds(id) ON DELETE CASCADE,
+        chapter_id TEXT NOT NULL,
+        chapter_revision INTEGER NOT NULL CHECK (chapter_revision >= 1),
+        prompt_version TEXT NOT NULL,
+        prompt TEXT NOT NULL,
+        status TEXT NOT NULL CHECK (status IN ('queued', 'in_progress', 'ready', 'failed')),
+        progress INTEGER NOT NULL DEFAULT 0 CHECK (progress >= 0 AND progress <= 100),
+        video_url TEXT,
+        provider TEXT,
+        provider_job_id TEXT,
+        provider_asset_id TEXT,
+        error_code TEXT,
+        retry_count INTEGER NOT NULL DEFAULT 0 CHECK (retry_count >= 0),
+        created_at TIMESTAMPTZ NOT NULL,
+        updated_at TIMESTAMPTZ NOT NULL
+      )`,
+      "CREATE INDEX IF NOT EXISTS story_trailers_lookup_idx ON story_trailers(world_id, chapter_id, chapter_revision, updated_at DESC)",
+      "CREATE INDEX IF NOT EXISTS story_trailers_status_idx ON story_trailers(status, updated_at DESC)",
+    ],
+  },
 ] as const;
 
 export const POSTGRES_MIGRATIONS_TABLE = "storyverse_schema_migrations";
