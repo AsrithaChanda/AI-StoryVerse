@@ -256,7 +256,7 @@ describe("world archive", () => {
     expect(store.claimTimeMachineJob(first.job.id)).toMatchObject({ status: "running", progress: 2 });
     expect(store.markTimeMachineJobProgress(first.job.id, "illustrating", 84, 3))
       .toMatchObject({ status: "illustrating", progress: 84, completedChapters: 3 });
-    expect(store.markTimeMachineJobCompleted(first.job.id))
+    expect(store.markTimeMachineJobCompleted(first.job.id, 3))
       .toMatchObject({ status: "completed", progress: 100, completedChapters: 3 });
     expect(store.findLatestTimeMachineJob(world.id)).toMatchObject({ id: first.job.id, status: "completed" });
 

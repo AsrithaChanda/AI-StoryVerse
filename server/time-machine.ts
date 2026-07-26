@@ -20,6 +20,11 @@ type TimeMachineRequest = {
   futurePrompt?: string;
 };
 
+export function affectedTimelineChapters(story: WorldStory, targetChapterId: string): StoryChapter[] {
+  const target = story.chapters.find((chapter) => chapter.id === targetChapterId);
+  return target ? story.chapters.filter((chapter) => chapter.number >= target.number) : [];
+}
+
 function isVersionedStore(store: StoryStore): store is VersionedStoryStore {
   return "getWorldStoryRecord" in store && typeof store.getWorldStoryRecord === "function";
 }
@@ -75,11 +80,19 @@ function worldStateAfter(chapter: StoryChapter, fallback: string): string {
 export async function regenerateTimeline(
   world: World,
   original: WorldStory,
-  job: StoredTimeMachineJob,
+  suppliedJob: StoredTimeMachineJob,
   onChapter: (completed: number) => Promise<void>,
 ): Promise<WorldStory | null> {
-  const targetIndex = original.chapters.findIndex((chapter) => chapter.id === job.targetChapterId);
-  if (targetIndex < 0 || targetIndex !== job.targetChapterNumber - 1) return null;
+  const targetIndex = original.chapters.findIndex((chapter) => chapter.id === suppliedJob.targetChapterId);
+  if (targetIndex < 0) return null;
+  const targetChapter = original.chapters[targetIndex]!;
+  // Derive scope from the canonical chapter identity. This also safely repairs
+  // jobs created by an older UI that stored the whole-world count.
+  const job: StoredTimeMachineJob = {
+    ...suppliedJob,
+    targetChapterNumber: targetChapter.number,
+    totalChapters: affectedTimelineChapters(original, targetChapter.id).length,
+  };
   const oldByNumber = new Map(original.chapters.map((chapter) => [chapter.number, chapter]));
   let working: WorldStory;
   let completed = 0;
@@ -157,15 +170,17 @@ export class TimeMachineService {
     if (!current) return null;
     const index = current.story.chapters.findIndex((chapter) => chapter.id === request.targetChapterId);
     if (index < 0) return null;
+    const target = current.story.chapters[index]!;
+    const affected = affectedTimelineChapters(current.story, target.id);
     const reservation = await this.store.reserveTimeMachineJob({
       worldId,
-      targetChapterId: request.targetChapterId,
-      targetChapterNumber: index + 1,
+      targetChapterId: target.id,
+      targetChapterNumber: target.number,
       changePrompt: request.changePrompt.trim(),
       futurePrompt: request.futurePrompt?.trim() || undefined,
       baseStoryVersion: current.version,
       baseStoryUpdatedAt: current.story.updatedAt,
-      totalChapters: current.story.chapters.length - index,
+      totalChapters: affected.length,
     });
     if (reservation.created || reservation.job.status === "queued") this.launch(reservation.job.id);
     return reservation;
@@ -181,15 +196,19 @@ export class TimeMachineService {
     const claimed = await this.store.claimTimeMachineJob(jobId);
     if (!claimed || claimed.status !== "running") return;
     let timelineApplied = false;
+    let completedScope = claimed.totalChapters;
     try {
       const [world, current] = await Promise.all([this.store.get(claimed.worldId), snapshot(this.store, claimed.worldId)]);
       if (!world || !current) throw new Error("source_missing");
       if (current.version !== claimed.baseStoryVersion || current.story.updatedAt !== claimed.baseStoryUpdatedAt) {
         throw new Error("timeline_changed");
       }
+      const effectiveTotal = affectedTimelineChapters(current.story, claimed.targetChapterId).length;
+      if (effectiveTotal < 1) throw new Error("source_missing");
+      completedScope = effectiveTotal;
       logInfo("time_machine.started", { worldId: claimed.worldId, chapter: claimed.targetChapterNumber, jobId });
       const replacement = await regenerateTimeline(world, current.story, claimed, async (completed) => {
-        const progress = 5 + Math.round((completed / claimed.totalChapters) * 70);
+        const progress = 5 + Math.round((completed / effectiveTotal) * 70);
         await this.store.markTimeMachineJobProgress(jobId, "running", progress, completed);
       });
       if (!replacement) throw new Error("generation_failed");
@@ -201,8 +220,9 @@ export class TimeMachineService {
       if (!saved) throw new Error("timeline_changed");
       timelineApplied = true;
 
-      await this.store.markTimeMachineJobProgress(jobId, "illustrating", 78, claimed.totalChapters);
-      const affected = saved.chapters.filter((chapter) => chapter.number >= claimed.targetChapterNumber);
+      await this.store.markTimeMachineJobProgress(jobId, "illustrating", 78, effectiveTotal);
+      const targetNumber = saved.chapters.find((chapter) => chapter.id === claimed.targetChapterId)?.number ?? claimed.targetChapterNumber;
+      const affected = saved.chapters.filter((chapter) => chapter.number >= targetNumber);
       const beats = affected.flatMap((chapter) => chapter.beats);
       let illustrated = 0;
       for (const beat of beats) {
@@ -214,17 +234,17 @@ export class TimeMachineService {
         }
         illustrated += 1;
         await this.store.markTimeMachineJobProgress(
-          jobId, "illustrating", 78 + Math.round((illustrated / Math.max(1, beats.length)) * 20), claimed.totalChapters,
+          jobId, "illustrating", 78 + Math.round((illustrated / Math.max(1, beats.length)) * 20), effectiveTotal,
         );
       }
-      await this.store.markTimeMachineJobCompleted(jobId);
+      await this.store.markTimeMachineJobCompleted(jobId, effectiveTotal);
       logInfo("time_machine.completed", { worldId: claimed.worldId, chapter: claimed.targetChapterNumber, jobId });
     } catch (error) {
       const code = error instanceof Error && /^[a-z_]{3,40}$/.test(error.message) ? error.message : "generation_failed";
       if (timelineApplied) {
         // The canonical rewrite is already committed. Illustration is
         // best-effort and each missing scene remains retryable from the UI.
-        await this.store.markTimeMachineJobCompleted(jobId);
+        await this.store.markTimeMachineJobCompleted(jobId, completedScope);
         logWarn("time_machine.completed_with_image_errors", { worldId: claimed.worldId, chapter: claimed.targetChapterNumber, jobId, errorCode: code });
       } else {
         await this.store.markTimeMachineJobFailed(jobId, code);

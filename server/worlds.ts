@@ -590,10 +590,12 @@ export class WorldStore {
     return this.getTimeMachineJob(jobId);
   }
 
-  public markTimeMachineJobCompleted(jobId: string): StoredTimeMachineJob | null {
+  public markTimeMachineJobCompleted(jobId: string, completedChapters: number): StoredTimeMachineJob | null {
+    const completed = Math.max(1, Math.floor(completedChapters));
     this.db.prepare(`UPDATE time_machine_jobs SET status = 'completed', progress = 100,
-      completed_chapters = total_chapters, error_code = NULL, updated_at = ?
-      WHERE id = ? AND status IN ('running', 'illustrating')`).run(new Date().toISOString(), jobId);
+      total_chapters = ?, completed_chapters = ?, error_code = NULL, updated_at = ?
+      WHERE id = ? AND status IN ('running', 'illustrating')`)
+      .run(completed, completed, new Date().toISOString(), jobId);
     return this.getTimeMachineJob(jobId);
   }
 

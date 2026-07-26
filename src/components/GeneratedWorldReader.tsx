@@ -163,8 +163,10 @@ export default function GeneratedWorldReader({ world, close }: { world: World; c
   const chapterIndex = chapter && story ? story.chapters.findIndex((candidate) => candidate.id === chapter.id) : -1;
   const isLatestChapter = Boolean(story && chapterIndex === story.chapters.length - 1);
   const timeMachineRunning = timeMachineJob?.status === "queued" || timeMachineJob?.status === "running" || timeMachineJob?.status === "illustrating";
+  const timeMachineTargetNumber = story?.chapters.find((candidate) => candidate.id === timeMachineJob?.targetChapterId)?.number
+    ?? timeMachineJob?.targetChapterNumber;
   const timeMachineStatusPending = timeMachineJob === undefined;
-  const chapterLocked = timeMachineStatusPending || Boolean(timeMachineRunning && chapter && chapter.number >= (timeMachineJob?.targetChapterNumber ?? Number.MAX_SAFE_INTEGER));
+  const chapterLocked = timeMachineStatusPending || Boolean(timeMachineRunning && chapter && chapter.number >= (timeMachineTargetNumber ?? Number.MAX_SAFE_INTEGER));
   const readerBusy = busy || timeMachineStatusPending || timeMachineRunning;
   const chapterArtifactKey = chapter ? `${chapter.id}-r${chapter.revision ?? 1}` : "chapter";
   const moment = activeCharacter ? "perspective_scene" as const : "chapter_scene" as const;
@@ -223,9 +225,10 @@ export default function GeneratedWorldReader({ world, close }: { world: World; c
     setTimeMachineJob(job);
     const active = job?.status === "queued" || job?.status === "running" || job?.status === "illustrating";
     if (!active || !story) return;
+    const targetNumber = story.chapters.find((candidate) => candidate.id === job.targetChapterId)?.number ?? job.targetChapterNumber;
     const selected = story.chapters.find((candidate) => candidate.id === selectedChapterId) ?? story.chapters.at(-1);
-    if (!selected || selected.number < job.targetChapterNumber) return;
-    const safeChapter = story.chapters[job.targetChapterNumber - 2];
+    if (!selected || selected.number < targetNumber) return;
+    const safeChapter = story.chapters.find((candidate) => candidate.number === targetNumber - 1);
     if (!safeChapter) return;
     setSelectedChapterId(safeChapter.id);
     setActiveCharacter(null);
@@ -237,7 +240,9 @@ export default function GeneratedWorldReader({ world, close }: { world: World; c
   const timeMachineCompleted = useCallback(async (job: TimeMachineJob) => {
     try {
       const { story: next } = await bootstrapStory(world.id);
-      const target = next.chapters.find((candidate) => candidate.number === job.targetChapterNumber) ?? next.chapters.at(-1);
+      const target = next.chapters.find((candidate) => candidate.id === job.targetChapterId)
+        ?? next.chapters.find((candidate) => candidate.number === job.targetChapterNumber)
+        ?? next.chapters.at(-1);
       illustrationTask.current += 1;
       setStoredImages({});
       setStory(next);
@@ -496,14 +501,14 @@ export default function GeneratedWorldReader({ world, close }: { world: World; c
               onCompleted={timeMachineCompleted}
             />
             {chapterLocked ? <div className="timeline-locked" role="status">
-              <p>{timeMachineStatusPending ? "STORY TIME MACHINE · CHECKING TIMELINE" : `STORY TIME MACHINE · CHAPTER ${timeMachineJob?.targetChapterNumber} ONWARDS`}</p>
+              <p>{timeMachineStatusPending ? "STORY TIME MACHINE · CHECKING TIMELINE" : `STORY TIME MACHINE · CHAPTER ${timeMachineTargetNumber} ONWARDS`}</p>
               <h2>{timeMachineStatusPending ? "Restoring the saved timeline status…" : "This part of the timeline is being rewritten."}</h2>
               <small>{timeMachineStatusPending ? "Your chapter will open after the current world status is confirmed." : "You can read the earlier chapters while the new future is generated and illustrated."}</small>
             </div> : <>
             {story.chapters.length > 1 && <nav className="chapter-archive" aria-label="Chapter history">
               <button type="button" onClick={() => showNarratorChapter(story.chapters[chapterIndex - 1])} disabled={chapterIndex <= 0}>← Previous</button>
               <span>CHAPTER {chapter.number} OF {story.chapters.length}</span>
-              <button type="button" onClick={() => showNarratorChapter(story.chapters[chapterIndex + 1])} disabled={chapterIndex >= story.chapters.length - 1 || Boolean(timeMachineRunning && story.chapters[chapterIndex + 1]?.number >= (timeMachineJob?.targetChapterNumber ?? Number.MAX_SAFE_INTEGER))}>Next →</button>
+              <button type="button" onClick={() => showNarratorChapter(story.chapters[chapterIndex + 1])} disabled={chapterIndex >= story.chapters.length - 1 || Boolean(timeMachineRunning && story.chapters[chapterIndex + 1]?.number >= (timeMachineTargetNumber ?? Number.MAX_SAFE_INTEGER))}>Next →</button>
             </nav>}
             {/* A rollback changes the selected timeline. Remount the action
               surface once the request settles so a completed confirmation

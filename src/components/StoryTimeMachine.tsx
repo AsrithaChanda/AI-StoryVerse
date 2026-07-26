@@ -82,6 +82,12 @@ export default function StoryTimeMachine({
   };
 
   const active = activeStatus(job);
+  const jobTargetIndex = job ? chapters.findIndex((chapter) => chapter.id === job.targetChapterId) : -1;
+  const displayedTargetNumber = jobTargetIndex >= 0 ? chapters[jobTargetIndex]!.number : job?.targetChapterNumber;
+  const displayedTotal = jobTargetIndex >= 0
+    ? chapters.filter((chapter) => chapter.number >= chapters[jobTargetIndex]!.number).length
+    : job?.totalChapters ?? 0;
+  const displayedCompleted = Math.min(job?.completedChapters ?? 0, displayedTotal);
   return <section className={`time-machine ${active ? "time-machine--active" : ""}`}>
     <header>
       <div><p><span /> WORLD FEATURE · STORY TIME MACHINE</p><h2>Change one choice. <em>Rewrite the future.</em></h2></div>
@@ -89,11 +95,11 @@ export default function StoryTimeMachine({
     </header>
     {active && job ? <div className="time-machine__running" role="status" aria-live="polite">
       <div className="time-machine__clock" aria-hidden="true"><i /><span /></div>
-      <div><p>TIME MACHINE TRIGGERED · CHAPTER {job.targetChapterNumber}</p>
+      <div><p>TIME MACHINE TRIGGERED · CHAPTER {displayedTargetNumber}</p>
         <h3>{job.status === "illustrating" ? "Drawing the new future…" : "Regenerating every future event…"}</h3>
-        <small>Chapter {job.targetChapterNumber} and every chapter after it are hidden until the new timeline is complete.</small>
+        <small>Chapter {displayedTargetNumber} and every chapter after it are hidden until the new timeline is complete.</small>
       </div>
-      <div className="time-machine__meter"><i><em style={{ width: `${job.progress}%` }} /></i><span>{job.progress}% · {job.completedChapters} of {job.totalChapters} chapters rewritten</span></div>
+      <div className="time-machine__meter"><i><em style={{ width: `${job.progress}%` }} /></i><span>{job.progress}% · {displayedCompleted} of {displayedTotal} chapters rewritten</span></div>
     </div> : <form onSubmit={(event) => void submit(event)}>
       <label>Jump to chapter<select value={targetChapterId} onChange={(event) => setTargetChapterId(event.target.value)} disabled={disabled || submitting}>
         {chapters.map((chapter) => <option value={chapter.id} key={chapter.id}>Chapter {chapter.number}: {chapter.title}</option>)}

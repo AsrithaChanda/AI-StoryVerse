@@ -1089,12 +1089,13 @@ export class PostgresWorldStore implements VersionedStoryStore {
     return result.rows[0] ? rowToTimeMachineJob(result.rows[0]) : this.getTimeMachineJob(jobId);
   }
 
-  public async markTimeMachineJobCompleted(jobId: string): Promise<StoredTimeMachineJob | null> {
+  public async markTimeMachineJobCompleted(jobId: string, completedChapters: number): Promise<StoredTimeMachineJob | null> {
     await this.ready();
+    const completed = Math.max(1, Math.floor(completedChapters));
     const result = await this.pool.query<TimeMachineJobRow>(`UPDATE time_machine_jobs
-      SET status = 'completed', progress = 100, completed_chapters = total_chapters,
-        error_code = NULL, updated_at = $2
-      WHERE id = $1 AND status IN ('running', 'illustrating') RETURNING *`, [jobId, this.now().toISOString()]);
+      SET status = 'completed', progress = 100, total_chapters = $2, completed_chapters = $2,
+        error_code = NULL, updated_at = $3
+      WHERE id = $1 AND status IN ('running', 'illustrating') RETURNING *`, [jobId, completed, this.now().toISOString()]);
     return result.rows[0] ? rowToTimeMachineJob(result.rows[0]) : this.getTimeMachineJob(jobId);
   }
 

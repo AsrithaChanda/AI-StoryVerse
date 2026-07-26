@@ -212,7 +212,7 @@ export interface StoryStore {
     progress: number,
     completedChapters: number,
   ): MaybePromise<StoredTimeMachineJob | null>;
-  markTimeMachineJobCompleted(jobId: string): MaybePromise<StoredTimeMachineJob | null>;
+  markTimeMachineJobCompleted(jobId: string, completedChapters: number): MaybePromise<StoredTimeMachineJob | null>;
   markTimeMachineJobFailed(jobId: string, errorCode: string): MaybePromise<StoredTimeMachineJob | null>;
 }
 
