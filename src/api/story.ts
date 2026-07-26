@@ -1,7 +1,10 @@
 export type StoryCharacter = { id: string; name: string; role: string; visualDescription: string; personality: string; goal: string; memories: string[]; /** Optional while legacy persisted casts are upgraded on read. */ introducedInChapter?: string };
 export type StoryBeat = { id: string; description: string; caption: string };
 export type StoryAudioDirection = { primaryEmotion: "reflection" | "suspense" | "danger" | "conflict" | "grief" | "triumph"; secondaryEmotion: "reflection" | "suspense" | "danger" | "conflict" | "grief" | "triumph"; intensity: number; bgmCue: "reflection" | "suspense" | "danger" | "conflict" | "grief" | "triumph"; narrationDelivery: string };
-export type StoryChapter = { id: string; number: number; title: string; narration: string; beats: StoryBeat[]; audioDirection?: StoryAudioDirection; command?: string; revision?: number };
+/** A compact closing handoff produced with a chapter, not a second chapter. */
+export type ChapterTransition = { resolvedBeat: string; closingImage: string; nextChapterHook: string; carryForward: string[] };
+/** `transition` remains optional so worlds saved before this contract still render normally. */
+export type StoryChapter = { id: string; number: number; title: string; narration: string; beats: StoryBeat[]; audioDirection?: StoryAudioDirection; command?: string; revision?: number; transition?: ChapterTransition };
 export type Perspective = { characterId: string; chapterId: string; narration: string; beats: StoryBeat[] };
 /** Optional while existing persisted stories are upgraded by the server. */
 export type WorldStory = { worldId: string; characters: StoryCharacter[]; chapters: StoryChapter[]; perspectives: Perspective[]; worldState: string; source: "openai" | "fallback"; createdAt: string; updatedAt: string; upcomingDirections?: string[]; /** Present for PostgreSQL-backed concurrent writes. */ version?: number };

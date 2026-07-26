@@ -25,6 +25,10 @@ export type ResponseDiagnostics = {
  * structure. Read both forms without ever logging model text.
  */
 export function extractOutputText(payload: OpenAIResponsePayload): string | null {
+  // A provider can include a partial text field alongside an incomplete
+  // response. Never let a truncated structured chapter look usable merely
+  // because that partial field happens to be present.
+  if (payload.status === "incomplete" || payload.status === "failed" || payload.incomplete_details) return null;
   if (typeof payload.output_text === "string" && payload.output_text.trim()) return payload.output_text;
   for (const item of payload.output ?? []) {
     for (const content of item.content ?? []) {

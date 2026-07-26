@@ -1,6 +1,11 @@
 import { Router, type Request, type Response } from "express";
 import { z } from "zod";
 import {
+  proposeChapterDirectorChange,
+  validateChapterDirectorProposal,
+  type ChapterDirectorProposal,
+} from "./chapter-director.js";
+import {
   generateInitialStory,
   generateNextChapter,
   generateNextChapterStream,
@@ -11,9 +16,11 @@ import {
   reviseLatestChapterStream,
   type ChapterRevisionGeneration,
   type NextChapterGeneration,
+  type StoryChapter,
   type StoryStreamCallbacks,
   type WorldStory,
 } from "./story.js";
+import { logWarn } from "./logger.js";
 import type { StoryStore, VersionedStoryStore } from "./persistence/store.js";
 import type { StoryChapterDeletionFailure } from "./worlds.js";
 
@@ -22,9 +29,18 @@ const commandSchema = z.object({ command: z.string().trim().min(3).max(1000) }).
 const characterSchema = z.object({ characterId: id }).strict();
 const directionSchema = z.object({ direction: z.string().trim().min(3).max(1000) }).strict();
 const revisionSchema = z.object({ prompt: z.string().trim().min(3).max(1000) }).strict();
+const directorPromptSchema = z.object({ prompt: z.string().trim().min(3).max(600) }).strict();
+const directorApplySchema = z.object({ proposal: z.unknown() }).strict();
 
 type StreamPhase = { stage: "writing" | "validating" };
 type StorySnapshot = { story: WorldStory; version?: number };
+type NextChapterGenerationFailure = {
+  error: string;
+  code: "next_chapter_generation_failed";
+  retryable: true;
+  queuedDirectionsPreserved: true;
+  queuedDirectionCount: number;
+};
 
 function beginSse(response: Response): void {
   response.status(200).set({
@@ -46,8 +62,8 @@ function storyStreamCallbacks(response: Response): StoryStreamCallbacks {
   };
 }
 
-function streamError(response: Response, error: string): void {
-  writeSse(response, "error", { error });
+function streamError(response: Response, error: string | { error: string; [key: string]: unknown }): void {
+  writeSse(response, "error", typeof error === "string" ? { error } : error);
   response.end();
 }
 
@@ -83,6 +99,38 @@ async function saveSnapshot(store: StoryStore, story: WorldStory, snapshot: Stor
   return store.saveWorldStory(story);
 }
 
+/**
+ * A failed generation never constructs or saves the candidate append, so a
+ * repeat of the same endpoint is safe: it starts from the existing chapter
+ * and the persisted one-shot direction queue. Keep that guarantee explicit
+ * in both the API payload and the human-readable SSE error the reader shows.
+ */
+function nextChapterGenerationFailure(story: WorldStory): NextChapterGenerationFailure {
+  const queuedDirectionCount = story.upcomingDirections?.filter((direction) => typeof direction === "string" && direction.trim().length > 0).length ?? 0;
+  const preservedState = queuedDirectionCount > 0
+    ? `${queuedDirectionCount} queued direction${queuedDirectionCount === 1 ? " is" : "s are"} still saved.`
+    : "Your current chapter is unchanged.";
+  return {
+    error: `The next chapter could not be generated. ${preservedState} Try again; if it keeps failing, check the AI provider connection and server logs.`,
+    code: "next_chapter_generation_failed",
+    retryable: true,
+    queuedDirectionsPreserved: true,
+    queuedDirectionCount,
+  };
+}
+
+/** Generation helpers normally return null on a provider/validation failure,
+ * but the route also protects its SSE response from an unexpected exception. */
+async function safelyGenerateNextChapter(run: () => Promise<NextChapterGeneration | null>): Promise<NextChapterGeneration | null> {
+  try {
+    return await run();
+  } catch (error) {
+    const reason = error instanceof Error && /^[A-Za-z0-9_.-]{1,64}$/.test(error.name) ? error.name : "unexpected";
+    logWarn("story.next_generation.route_failure", { reason });
+    return null;
+  }
+}
+
 function appendGeneratedChapter(existing: WorldStory, generated: NextChapterGeneration): WorldStory {
   return {
     ...existing,
@@ -106,6 +154,27 @@ function replaceLatestChapter(existing: WorldStory, generated: ChapterRevisionGe
     // text, so they must be regenerated after a revision.
     perspectives: existing.perspectives.filter((entry) => entry.chapterId !== current.id),
   };
+}
+
+/**
+ * The Director is intentionally narrower than the general revision flow: it
+ * replaces one reviewed canonical chapter, preserves the cast/world/future
+ * queue byte-for-byte, and clears only POVs derived from that old chapter.
+ */
+function replaceLatestChapterFromDirector(existing: WorldStory, proposal: ChapterDirectorProposal): WorldStory | null {
+  const current = existing.chapters.at(-1);
+  const replacement = proposal.proposedChapter;
+  if (!current || current.id !== proposal.chapterId || current.id !== replacement.id || current.number !== replacement.number) return null;
+  return {
+    ...existing,
+    chapters: [...existing.chapters.slice(0, -1), replacement],
+    perspectives: existing.perspectives.filter((entry) => entry.chapterId !== current.id),
+  };
+}
+
+function latestDirectorChapter(snapshot: StorySnapshot, chapterId: string): StoryChapter | null {
+  const current = snapshot.story.chapters.at(-1);
+  return current?.id === chapterId ? current : null;
 }
 
 /**
@@ -176,6 +245,51 @@ export function createStoryRouter(store: StoryStore): Router {
     return story ? response.json({ story }) : response.status(409).json({ error: "The story changed while the direction was being saved. Reload and try again." });
   });
 
+  /**
+   * Proposal stage: only the latest canonical chapter is passed to the
+   * bounded Director model. This endpoint never persists a story change.
+   */
+  router.post("/worlds/:worldId/story/chapters/:chapterId/director/propose", async (request, response) => {
+    const parsed = directorPromptSchema.safeParse(request.body);
+    if (!parsed.success) return response.status(400).json({ error: "A 3–600 character Director prompt is required" });
+    const worldId = id.safeParse(request.params.worldId);
+    const chapterId = id.safeParse(request.params.chapterId);
+    if (!worldId.success || !chapterId.success) return response.status(400).json({ error: "Invalid world or chapter identifier" });
+    if (!await store.get(worldId.data)) return response.status(404).json({ error: "World not found" });
+    const snapshot = await storySnapshot(store, worldId.data);
+    if (!snapshot) return response.status(409).json({ error: "Generate Chapter 1 first" });
+    const current = latestDirectorChapter(snapshot, chapterId.data);
+    if (!current) return response.status(409).json({ error: "AI Story Director can edit only the current canonical chapter" });
+    const proposal = await proposeChapterDirectorChange(current, parsed.data.prompt);
+    if (!proposal) return response.status(503).json({ error: "The AI Story Director could not prepare a chapter change" });
+    return response.json({ proposal });
+  });
+
+  /**
+   * Apply stage: no second model call. The previously displayed proposal is
+   * structurally revalidated against the latest chapter before a CAS save.
+   */
+  router.post("/worlds/:worldId/story/chapters/:chapterId/director/apply", async (request, response) => {
+    const parsed = directorApplySchema.safeParse(request.body);
+    if (!parsed.success) return response.status(400).json({ error: "A Director proposal is required" });
+    const worldId = id.safeParse(request.params.worldId);
+    const chapterId = id.safeParse(request.params.chapterId);
+    if (!worldId.success || !chapterId.success) return response.status(400).json({ error: "Invalid world or chapter identifier" });
+    if (!await store.get(worldId.data)) return response.status(404).json({ error: "World not found" });
+    const snapshot = await storySnapshot(store, worldId.data);
+    if (!snapshot) return response.status(409).json({ error: "Generate Chapter 1 first" });
+    const current = latestDirectorChapter(snapshot, chapterId.data);
+    if (!current) return response.status(409).json({ error: "AI Story Director can apply changes only to the current canonical chapter" });
+    const proposal = validateChapterDirectorProposal(parsed.data.proposal, current);
+    if (!proposal) return response.status(409).json({ error: "This chapter has changed since the Director preview. Preview the change again." });
+    const updated = replaceLatestChapterFromDirector(snapshot.story, proposal);
+    if (!updated) return response.status(409).json({ error: "This chapter has changed since the Director preview. Preview the change again." });
+    const story = await saveSnapshot(store, updated, snapshot);
+    if (!story) return response.status(409).json({ error: "This chapter changed before the Director proposal could be applied. Preview it again." });
+    const chapter = story.chapters.at(-1);
+    return chapter ? response.json({ story, chapter }) : response.status(500).json({ error: "The Director change could not be saved" });
+  });
+
   router.post("/worlds/:worldId/story/revise", async (request, response) => {
     const parsed = revisionSchema.safeParse(request.body);
     if (!parsed.success) return response.status(400).json({ error: "A 3–1000 character revision prompt is required" });
@@ -218,8 +332,8 @@ export function createStoryRouter(store: StoryStore): Router {
     if (!world) return response.status(404).json({ error: "World not found" });
     const snapshot = await storySnapshot(store, world.id);
     if (!snapshot) return response.status(409).json({ error: "Generate Chapter 1 first" });
-    const generated = await generateNextChapter(world, snapshot.story);
-    if (!generated) return response.status(503).json({ error: "The next chapter could not be generated" });
+    const generated = await safelyGenerateNextChapter(() => generateNextChapter(world, snapshot.story));
+    if (!generated) return response.status(503).json(nextChapterGenerationFailure(snapshot.story));
     const story = await saveSnapshot(store, appendGeneratedChapter(snapshot.story, generated), snapshot);
     return story ? response.json({ story }) : response.status(409).json({ error: "The story changed while the next chapter was being generated. Reload and try again." });
   });
@@ -231,8 +345,8 @@ export function createStoryRouter(store: StoryStore): Router {
     if (!snapshot) return response.status(409).json({ error: "Generate Chapter 1 first" });
     beginSse(response);
     writeSse(response, "phase", { stage: "writing" } satisfies StreamPhase);
-    const generated = await generateNextChapterStream(world, snapshot.story, storyStreamCallbacks(response));
-    if (!generated) return streamError(response, "The next chapter could not be generated");
+    const generated = await safelyGenerateNextChapter(() => generateNextChapterStream(world, snapshot.story, storyStreamCallbacks(response)));
+    if (!generated) return streamError(response, nextChapterGenerationFailure(snapshot.story));
     try {
       const story = await saveSnapshot(store, appendGeneratedChapter(snapshot.story, generated), snapshot);
       if (!story) return streamError(response, "The story changed while the next chapter was being generated. Reload and try again.");

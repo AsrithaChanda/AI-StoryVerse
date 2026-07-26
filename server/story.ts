@@ -1,7 +1,7 @@
 import type { World } from "./worlds.js";
 import { logWarn } from "./logger.js";
 import { extractOutputText, responseDiagnostics, type OpenAIResponsePayload } from "./openai-response.js";
-import { collectResponseOutputText, NarrationJsonDeltaDecoder } from "./story-stream.js";
+import { collectResponseOutputText, NarrationJsonDeltaDecoder, readProviderSse } from "./story-stream.js";
 
 export type StoryCharacter = {
   id: string;
@@ -17,7 +17,13 @@ export type StoryCharacter = {
 
 export type StoryBeat = { id: string; description: string; caption: string };
 export type StoryAudioDirection = { primaryEmotion: "reflection" | "suspense" | "danger" | "conflict" | "grief" | "triumph"; secondaryEmotion: "reflection" | "suspense" | "danger" | "conflict" | "grief" | "triumph"; intensity: number; bgmCue: "reflection" | "suspense" | "danger" | "conflict" | "grief" | "triumph"; narrationDelivery: string };
-export type StoryChapter = { id: string; number: number; title: string; narration: string; beats: StoryBeat[]; audioDirection?: StoryAudioDirection; command?: string; /** Starts at 1; later revisions receive unique visual/audio identities. */ revision?: number };
+/**
+ * Compact continuity contract between adjacent canonical chapters. It is
+ * intentionally chapter-local: it describes what this chapter settled, the
+ * final image it earned, and only the immediate pressure carried forward.
+ */
+export type ChapterTransition = { resolvedBeat: string; closingImage: string; nextChapterHook: string; carryForward: string[] };
+export type StoryChapter = { id: string; number: number; title: string; narration: string; beats: StoryBeat[]; audioDirection?: StoryAudioDirection; /** Optional while legacy saved chapters are read without migration. */ transition?: ChapterTransition; command?: string; /** Starts at 1; later revisions receive unique visual/audio identities. */ revision?: number };
 export type Perspective = { characterId: string; chapterId: string; narration: string; beats: StoryBeat[] };
 export type WorldStory = {
   worldId: string;
@@ -53,19 +59,19 @@ const schema = {
   type: "object", additionalProperties: false, required: ["characters", "chapter", "worldState"], properties: {
     worldState: { type: "string", minLength: 30, maxLength: 600 },
     characters: { type: "array", minItems: 1, items: { type: "object", additionalProperties: false, required: ["id", "name", "role", "visualDescription", "personality", "goal", "memories"], properties: { id: { type: "string", minLength: 1, maxLength: 128 }, name: { type: "string", minLength: 1, maxLength: 160 }, role: { type: "string", minLength: 1, maxLength: 240 }, visualDescription: { type: "string", minLength: 1, maxLength: 1200 }, personality: { type: "string", minLength: 1, maxLength: 800 }, goal: { type: "string", minLength: 1, maxLength: 800 }, memories: { type: "array", items: { type: "string", minLength: 1, maxLength: 1200 } } } } },
-    chapter: { type: "object", additionalProperties: false, required: ["id", "number", "title", "narration", "beats", "audioDirection"], properties: { id: { type: "string" }, number: { type: "integer" }, title: { type: "string" }, narration: { type: "string", minLength: 350, maxLength: 2400 }, beats: { type: "array", minItems: 3, maxItems: 4, items: { type: "object", additionalProperties: false, required: ["id", "description", "caption"], properties: { id: { type: "string" }, description: { type: "string" }, caption: { type: "string" } } } }, audioDirection: { type: "object", additionalProperties: false, required: ["primaryEmotion", "secondaryEmotion", "intensity", "bgmCue", "narrationDelivery"], properties: { primaryEmotion: { type: "string", enum: ["reflection", "suspense", "danger", "conflict", "grief", "triumph"] }, secondaryEmotion: { type: "string", enum: ["reflection", "suspense", "danger", "conflict", "grief", "triumph"] }, intensity: { type: "number", minimum: 0, maximum: 1 }, bgmCue: { type: "string", enum: ["reflection", "suspense", "danger", "conflict", "grief", "triumph"] }, narrationDelivery: { type: "string", minLength: 3, maxLength: 100 } } } } },
+    chapter: { type: "object", additionalProperties: false, required: ["id", "number", "title", "narration", "beats", "audioDirection", "transition"], properties: { id: { type: "string" }, number: { type: "integer" }, title: { type: "string" }, narration: { type: "string", minLength: 350 }, beats: { type: "array", minItems: 3, maxItems: 4, items: { type: "object", additionalProperties: false, required: ["id", "description", "caption"], properties: { id: { type: "string" }, description: { type: "string" }, caption: { type: "string" } } } }, audioDirection: { type: "object", additionalProperties: false, required: ["primaryEmotion", "secondaryEmotion", "intensity", "bgmCue", "narrationDelivery"], properties: { primaryEmotion: { type: "string", enum: ["reflection", "suspense", "danger", "conflict", "grief", "triumph"] }, secondaryEmotion: { type: "string", enum: ["reflection", "suspense", "danger", "conflict", "grief", "triumph"] }, intensity: { type: "number", minimum: 0, maximum: 1 }, bgmCue: { type: "string", enum: ["reflection", "suspense", "danger", "conflict", "grief", "triumph"] }, narrationDelivery: { type: "string", minLength: 3, maxLength: 100 } } }, transition: { type: "object", additionalProperties: false, required: ["resolvedBeat", "closingImage", "nextChapterHook", "carryForward"], properties: { resolvedBeat: { type: "string", minLength: 8, maxLength: 420 }, closingImage: { type: "string", minLength: 8, maxLength: 420 }, nextChapterHook: { type: "string", minLength: 8, maxLength: 420 }, carryForward: { type: "array", minItems: 1, maxItems: 4, items: { type: "string", minLength: 8, maxLength: 420 } } } } } },
   },
 };
 
 const canonicalChapterSchema = {
   type: "object", additionalProperties: false,
-  required: ["id", "number", "title", "narration", "beats", "audioDirection"],
+  required: ["id", "number", "title", "narration", "beats", "audioDirection", "transition"],
   properties: schema.properties.chapter.properties,
 };
 
 const nextChapterSchema = {
   type: "object", additionalProperties: false,
-  required: ["id", "number", "title", "narration", "beats", "audioDirection", "newCharacters"],
+  required: ["id", "number", "title", "narration", "beats", "audioDirection", "transition", "newCharacters"],
   properties: {
     ...schema.properties.chapter.properties,
     newCharacters: { type: "array", minItems: 0, items: schema.properties.characters.items },
@@ -74,7 +80,7 @@ const nextChapterSchema = {
 
 const revisionChapterSchema = {
   type: "object", additionalProperties: false,
-  required: ["id", "number", "title", "narration", "beats", "audioDirection", "newCharacters"],
+  required: ["id", "number", "title", "narration", "beats", "audioDirection", "transition", "newCharacters"],
   properties: {
     ...canonicalChapterSchema.properties,
     newCharacters: { type: "array", minItems: 0, items: schema.properties.characters.items },
@@ -97,6 +103,110 @@ function normalizeAudioDirection(value: unknown, text: string): StoryAudioDirect
 
 function normalizedRevision(value: unknown): number {
   return typeof value === "number" && Number.isInteger(value) && value >= 1 ? value : 1;
+}
+
+function compactTransitionText(value: unknown, maximum = 240): string {
+  if (typeof value !== "string") return "the chapter's unresolved consequence";
+  const compact = value.replace(/\s+/g, " ").trim();
+  if (!compact) return "the chapter's unresolved consequence";
+  return compact.length > maximum ? `${compact.slice(0, maximum - 1).trimEnd()}…` : compact;
+}
+
+/** Safe diagnostics: only field shape/count metadata, never generated prose. */
+type CanonicalValidationDiagnostics = {
+  reason?: string;
+  narrationLength?: number;
+  beatCount?: number;
+  transitionPresent?: boolean;
+  transitionKind?: string;
+  carryForwardCount?: number;
+  newCharacterCount?: number;
+  directionCount?: number;
+};
+
+function noteValidation(diagnostics: CanonicalValidationDiagnostics | undefined, reason: string, details: Omit<CanonicalValidationDiagnostics, "reason"> = {}): void {
+  if (!diagnostics || diagnostics.reason) return;
+  diagnostics.reason = reason;
+  Object.assign(diagnostics, details);
+}
+
+function transitionKind(value: unknown): string {
+  if (value === undefined) return "missing";
+  if (value === null) return "null";
+  if (Array.isArray(value)) return "array";
+  return typeof value;
+}
+
+/**
+ * Old stored chapters have no transition. Derive one only as compact context
+ * for their immediate successor; newly generated chapters persist a model
+ * transition instead of retroactively mutating legacy records.
+ */
+function fallbackChapterTransition(chapter: Pick<StoryChapter, "narration" | "beats">): ChapterTransition {
+  const opening = compactTransitionText(chapter.beats[0]?.description ?? chapter.narration);
+  const closing = compactTransitionText(chapter.beats.at(-1)?.description ?? chapter.narration);
+  const carryForward = compactTransitionText(chapter.beats.at(-1)?.caption ?? closing, 160);
+  return {
+    resolvedBeat: `The chapter brings its immediate pressure to a decision: ${opening}`,
+    closingImage: `The chapter closes on ${closing}`,
+    nextChapterHook: `What consequence follows from ${carryForward}?`,
+    carryForward: [`Carry forward the immediate consequence of ${carryForward}.`],
+  };
+}
+
+/** Provider responses must supply all four transition fields and nothing else. */
+function normalizeChapterTransition(value: unknown, diagnostics?: CanonicalValidationDiagnostics): ChapterTransition | null {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    noteValidation(diagnostics, "invalid_transition_shape", { transitionPresent: value !== undefined, transitionKind: transitionKind(value) });
+    return null;
+  }
+  const transition = value as Record<string, unknown>;
+  const allowed = new Set(["resolvedBeat", "closingImage", "nextChapterHook", "carryForward"]);
+  if (Object.keys(transition).some((key) => !allowed.has(key))) {
+    noteValidation(diagnostics, "invalid_transition_fields", { transitionPresent: true, transitionKind: "object" });
+    return null;
+  }
+  const normalize = (field: unknown): string | null => {
+    if (typeof field !== "string") return null;
+    const compact = field.replace(/\s+/g, " ").trim();
+    return compact.length >= 8 && compact.length <= 420 ? compact : null;
+  };
+  const resolvedBeat = normalize(transition.resolvedBeat);
+  const closingImage = normalize(transition.closingImage);
+  const nextChapterHook = normalize(transition.nextChapterHook);
+  if (!resolvedBeat || !closingImage || !nextChapterHook) {
+    noteValidation(diagnostics, "invalid_transition_text", { transitionPresent: true, transitionKind: "object" });
+    return null;
+  }
+  const rawCarryForward = transition.carryForward;
+  const carryForward = Array.isArray(rawCarryForward) && rawCarryForward.length >= 1 && rawCarryForward.length <= 4
+    ? rawCarryForward.map(normalize)
+    : null;
+  if (!carryForward || carryForward.some((entry) => !entry)) {
+    noteValidation(diagnostics, "invalid_transition_carry_forward", {
+      transitionPresent: true,
+      transitionKind: "object",
+      ...(Array.isArray(rawCarryForward) ? { carryForwardCount: rawCarryForward.length } : {}),
+    });
+    return null;
+  }
+  const uniqueCarryForward = carryForward as string[];
+  if (new Set(uniqueCarryForward.map((entry) => entry.toLocaleLowerCase())).size !== uniqueCarryForward.length) {
+    noteValidation(diagnostics, "duplicate_transition_carry_forward", { transitionPresent: true, transitionKind: "object", carryForwardCount: uniqueCarryForward.length });
+    return null;
+  }
+  return { resolvedBeat, closingImage, nextChapterHook, carryForward: uniqueCarryForward };
+}
+
+function previousChapterTransition(chapter: StoryChapter): ChapterTransition {
+  // Legacy persisted chapters predate the transition contract. Never mutate
+  // them on read; derive a compact one only for this one next-chapter prompt.
+  return chapter.transition === undefined ? fallbackChapterTransition(chapter) : normalizeChapterTransition(chapter.transition) ?? fallbackChapterTransition(chapter);
+}
+
+/** Do not persist literal model cutoffs as a completed canonical chapter. */
+function hasClosedNarration(value: unknown): boolean {
+  return typeof value === "string" && /[.!?](?:["'”’»)\]}]*)$/.test(value.trim());
 }
 
 function normalizedDirections(value: unknown): string[] {
@@ -146,11 +256,23 @@ function tagCharacterOrigins(characters: StoryCharacter[], chapterId: string): S
 
 /** Provider beat labels repeat frequently (for example, `beat_01`). IDs are
  * canonical scene identities, so every chapter owns a distinct image cache. */
-function normalizeChapter(payload: StoryChapter, number: number, command?: string, revision = 1): StoryChapter {
+function normalizeChapter(payload: StoryChapter, number: number, command?: string, revision = 1, diagnostics?: CanonicalValidationDiagnostics): StoryChapter | null {
+  if (!hasClosedNarration(payload.narration)) {
+    noteValidation(diagnostics, "narration_unclosed", { narrationLength: typeof payload.narration === "string" ? payload.narration.trim().length : 0 });
+    return null;
+  }
+  if (!Array.isArray(payload.beats) || payload.beats.length < 3 || payload.beats.length > 4) {
+    noteValidation(diagnostics, "invalid_beat_count", { beatCount: Array.isArray(payload.beats) ? payload.beats.length : 0 });
+    return null;
+  }
+  if (!payload.beats.every((beat) => beat && typeof beat.description === "string" && beat.description.trim() && typeof beat.caption === "string" && beat.caption.trim())) {
+    noteValidation(diagnostics, "invalid_beat_shape", { beatCount: payload.beats.length });
+    return null;
+  }
   const id = `chapter-${number}`;
   const normalized = normalizedRevision(revision);
   const beatPrefix = normalized > 1 ? `${id}-r${normalized}` : id;
-  return {
+  const chapter = {
     id,
     number,
     title: payload.title,
@@ -160,6 +282,8 @@ function normalizeChapter(payload: StoryChapter, number: number, command?: strin
     audioDirection: normalizeAudioDirection(payload.audioDirection, `${payload.title}\n${payload.narration}`),
     beats: payload.beats.map((beat, index) => ({ ...beat, id: `${beatPrefix}-beat-${index + 1}` })),
   };
+  const transition = normalizeChapterTransition(payload.transition, diagnostics);
+  return transition ? { ...chapter, transition } : null;
 }
 
 function perspectiveBeatPrefix(chapter: StoryChapter, characterId: string): string {
@@ -172,30 +296,134 @@ function emptyStory(worldId: string): WorldStory {
   return { worldId, characters: [], chapters: [], perspectives: [], upcomingDirections: [], worldState: "This world awaits its first generated chapter.", source: "fallback", createdAt: time, updatedAt: time };
 }
 
-async function modelJson<T>(instructions: string, input: string, responseSchema: object): Promise<T | null> {
+/** Room for a complete chapter + strict JSON, bounded to control latency/cost. */
+function storyMaxOutputTokens(): number {
+  const configured = Number(process.env.STORYVERSE_STORY_MAX_OUTPUT_TOKENS ?? 6_000);
+  if (!Number.isFinite(configured)) return 6_000;
+  return Math.min(16_000, Math.max(1_000, Math.floor(configured)));
+}
+
+function retryOutputTokens(current: number): number {
+  return Math.min(16_000, Math.max(current, current * 2));
+}
+
+function responseIsIncomplete(value: OpenAIResponsePayload): boolean {
+  return value.status === "incomplete" || value.incomplete_details !== undefined && value.incomplete_details !== null;
+}
+
+function isOutputLimitReason(value: unknown): boolean {
+  return value === "max_output_tokens" || value === "max_tokens";
+}
+
+function responseExceededOutputLimit(value: OpenAIResponsePayload): boolean {
+  return responseIsIncomplete(value) && isOutputLimitReason(value.incomplete_details?.reason);
+}
+
+/** Some Responses-compatible gateways use `text` for a normal text content part. */
+function storyOutputText(value: OpenAIResponsePayload): string | null {
+  const standard = extractOutputText(value);
+  if (standard) return standard;
+  for (const item of value.output ?? []) {
+    for (const content of item.content ?? []) {
+      if (content.type === "text" && typeof content.text === "string" && content.text.trim()) return content.text;
+    }
+  }
+  return null;
+}
+
+type ModelJsonAttempt<T> =
+  | { kind: "success"; value: T }
+  | { kind: "retryable"; reason: "max_output_tokens" | "invalid_response" }
+  | { kind: "failed" };
+
+async function requestModelJson<T>(
+  key: string,
+  instructions: string,
+  input: string,
+  responseSchema: object,
+  maxOutputTokens: number,
+): Promise<ModelJsonAttempt<T>> {
+  try {
+    const response = await fetch("https://api.openai.com/v1/responses", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Authorization: `Bearer ${key}` },
+      body: JSON.stringify({
+        model: process.env.OPENAI_MODEL || "gpt-4.1-mini",
+        instructions,
+        input,
+        max_output_tokens: maxOutputTokens,
+        text: { format: { type: "json_schema", name: "story_payload", strict: true, schema: responseSchema } },
+      }),
+    });
+    if (!response.ok) {
+      logWarn("story.generation.provider_error", { status: response.status });
+      return { kind: "failed" };
+    }
+    const result = await response.json() as OpenAIResponsePayload;
+    if (responseIsIncomplete(result)) {
+      logWarn("story.generation.incomplete_response", responseDiagnostics(result));
+      return responseExceededOutputLimit(result) ? { kind: "retryable", reason: "max_output_tokens" } : { kind: "failed" };
+    }
+    if (typeof result.status === "string" && result.status !== "completed") {
+      logWarn("story.generation.terminal_response", responseDiagnostics(result));
+      return { kind: "failed" };
+    }
+    const outputText = storyOutputText(result);
+    if (!outputText) {
+      logWarn("story.generation.invalid_response", { reason: "missing_output_text", ...responseDiagnostics(result) });
+      return { kind: "retryable", reason: "invalid_response" };
+    }
+    try {
+      return { kind: "success", value: JSON.parse(outputText) as T };
+    } catch {
+      logWarn("story.generation.invalid_response", { reason: "invalid_json" });
+      return { kind: "retryable", reason: "invalid_response" };
+    }
+  } catch (error) {
+    logWarn("story.generation.request_error", { reason: error instanceof Error ? error.name : "unknown" });
+    return { kind: "failed" };
+  }
+}
+
+/** The streaming endpoint emits completion status separately from text deltas. */
+async function streamIncompleteReason(body: ReadableStream<Uint8Array>): Promise<"max_output_tokens" | "other" | null> {
+  for await (const event of readProviderSse(body)) {
+    try {
+      const payload = JSON.parse(event.data) as {
+        type?: unknown;
+        status?: unknown;
+        incomplete_details?: { reason?: unknown } | null;
+        response?: { status?: unknown; incomplete_details?: { reason?: unknown } | null };
+      };
+      const incomplete = event.event === "response.incomplete" || payload.type === "response.incomplete" || payload.status === "incomplete" || payload.incomplete_details !== undefined && payload.incomplete_details !== null || payload.response?.status === "incomplete" || payload.response?.incomplete_details !== undefined && payload.response.incomplete_details !== null;
+      if (incomplete) {
+        const reason = payload.response?.incomplete_details?.reason ?? payload.incomplete_details?.reason;
+        return isOutputLimitReason(reason) ? "max_output_tokens" : "other";
+      }
+    } catch {
+      // The text collector owns malformed-event validation. It will reject it.
+      if (event.event === "response.incomplete") return "other";
+    }
+  }
+  return null;
+}
+
+async function modelJson<T>(instructions: string, input: string, responseSchema: object, initialOutputTokens = storyMaxOutputTokens()): Promise<T | null> {
   const key = process.env.OPENAI_API_KEY;
   if (!key) {
     logWarn("story.generation.unavailable", { reason: "missing_api_key" });
     return null;
   }
-  try {
-    const response = await fetch("https://api.openai.com/v1/responses", { method: "POST", headers: { "Content-Type": "application/json", Authorization: `Bearer ${key}` }, body: JSON.stringify({ model: process.env.OPENAI_MODEL || "gpt-4.1-mini", instructions, input, text: { format: { type: "json_schema", name: "story_payload", strict: true, schema: responseSchema } } }) });
-    if (!response.ok) {
-      logWarn("story.generation.provider_error", { status: response.status });
-      return null;
-    }
-    const result = await response.json() as OpenAIResponsePayload;
-    const outputText = extractOutputText(result);
-    if (!outputText) {
-      logWarn("story.generation.invalid_response", { reason: "missing_output_text", ...responseDiagnostics(result) });
-      return null;
-    }
-    try { return JSON.parse(outputText) as T; }
-    catch { logWarn("story.generation.invalid_response", { reason: "invalid_json" }); return null; }
-  } catch (error) {
-    logWarn("story.generation.request_error", { reason: error instanceof Error ? error.name : "unknown" });
-    return null;
+  const firstBudget = Math.min(16_000, Math.max(1_000, initialOutputTokens));
+  const first = await requestModelJson<T>(key, instructions, input, responseSchema, firstBudget);
+  if (first.kind === "success") return first.value;
+  if (first.kind === "retryable") {
+    const retryBudget = retryOutputTokens(firstBudget);
+    logWarn("story.generation.retrying", { reason: first.reason, fromOutputTokens: firstBudget, toOutputTokens: retryBudget });
+    const retried = await requestModelJson<T>(key, instructions, input, responseSchema, retryBudget);
+    return retried.kind === "success" ? retried.value : null;
   }
+  return null;
 }
 
 /**
@@ -215,6 +443,7 @@ async function modelJsonStream<T>(
     return null;
   }
   try {
+    const outputBudget = storyMaxOutputTokens();
     const response = await fetch("https://api.openai.com/v1/responses", {
       method: "POST",
       headers: { "Content-Type": "application/json", Accept: "text/event-stream", Authorization: `Bearer ${key}` },
@@ -222,6 +451,7 @@ async function modelJsonStream<T>(
         model: process.env.OPENAI_MODEL || "gpt-4.1-mini",
         instructions,
         input,
+        max_output_tokens: outputBudget,
         stream: true,
         text: { format: { type: "json_schema", name: "story_payload", strict: true, schema: responseSchema } },
       }),
@@ -230,13 +460,20 @@ async function modelJsonStream<T>(
       logWarn("story.generation.provider_error", { status: response.status });
       return null;
     }
+    const [textBody, statusBody] = response.body.tee();
     const narrationDecoder = new NarrationJsonDeltaDecoder();
-    const streamed = await collectResponseOutputText(response.body, (rawDelta) => {
+    const [streamed, incomplete] = await Promise.all([collectResponseOutputText(textBody, (rawDelta) => {
       const narration = narrationDecoder.push(rawDelta);
       if (narration) callbacks.onNarration?.(narration);
-    });
+    }), streamIncompleteReason(statusBody)]);
+    if (incomplete) {
+      logWarn("story.generation.incomplete_response", { source: "stream", reason: incomplete });
+      if (incomplete === "max_output_tokens" && outputBudget < 16_000) return modelJson<T>(instructions, input, responseSchema, retryOutputTokens(outputBudget));
+      return null;
+    }
     if (!streamed.ok) {
       logWarn("story.generation.stream_error", { reason: streamed.reason });
+      if (streamed.reason === "invalid_response") return modelJson<T>(instructions, input, responseSchema, outputBudget);
       return null;
     }
     callbacks.onPhase?.("validating");
@@ -244,7 +481,7 @@ async function modelJsonStream<T>(
       return JSON.parse(streamed.outputText) as T;
     } catch {
       logWarn("story.generation.invalid_response", { reason: "invalid_json" });
-      return null;
+      return modelJson<T>(instructions, input, responseSchema, outputBudget);
     }
   } catch (error) {
     logWarn("story.generation.request_error", { reason: error instanceof Error ? error.name : "unknown" });
@@ -253,50 +490,111 @@ async function modelJsonStream<T>(
 }
 
 const originalGuard = "Create original characters and an original plot. A user-supplied title or genre may evoke an existing work, but never reuse protected named characters, dialogue, plot events, costumes, or scenes from it. Do not include real-world celebrity likenesses.";
+const transitionInstruction = "Write 1,200–1,700 characters of narration in four to six short paragraphs, reserving a final closing paragraph rather than writing to the response limit. Finish narration with a complete terminal sentence, never mid-sentence. Every canonical chapter must resolve one immediate beat inside its own events and end as a deliberate, satisfying unit. Return transition with resolvedBeat (what this chapter actually settles), closingImage (the earned final image), nextChapterHook (one fresh immediate pressure only), and carryForward (an array of one to four concise facts or consequences the next chapter must honor).";
+const chapterRepairInstruction = "A prior draft was rejected by the canonical chapter validator. Produce a fresh, complete replacement now: write 1,200–1,600 characters in four to six short paragraphs, reserve a final closing paragraph, retain every required JSON field, include a valid transition, use three or four imageable beats, and end narration with a completed terminal sentence. Never return a partial draft.";
+
+type CanonicalRequest = { instructions: string; input: string; responseSchema: object };
+
+function validationLogFields(diagnostics: CanonicalValidationDiagnostics): Record<string, string | number | boolean | undefined> {
+  return {
+    validationReason: diagnostics.reason ?? "unknown",
+    narrationLength: diagnostics.narrationLength,
+    beatCount: diagnostics.beatCount,
+    transitionPresent: diagnostics.transitionPresent,
+    transitionKind: diagnostics.transitionKind,
+    carryForwardCount: diagnostics.carryForwardCount,
+    newCharacterCount: diagnostics.newCharacterCount,
+    directionCount: diagnostics.directionCount,
+  };
+}
+
+/** A repair is only attempted after a provider returned parseable JSON that failed local canonical validation. */
+async function normalizeCanonicalWithRepair<T, R>(
+  payload: T | null,
+  normalize: (candidate: T, diagnostics?: CanonicalValidationDiagnostics) => R | null,
+  request: CanonicalRequest,
+): Promise<R | null> {
+  const diagnostics: CanonicalValidationDiagnostics = {};
+  const normalized = payload ? normalize(payload, diagnostics) : null;
+  if (normalized || !payload) return normalized;
+  logWarn("story.generation.contract_repair", { contract: "canonical_chapter", ...validationLogFields(diagnostics) });
+  const repaired = await modelJson<T>(`${request.instructions} ${chapterRepairInstruction}`, request.input, request.responseSchema);
+  if (!repaired) return null;
+  const repairDiagnostics: CanonicalValidationDiagnostics = {};
+  const repairedNormalized = normalize(repaired, repairDiagnostics);
+  if (!repairedNormalized) logWarn("story.generation.contract_repair_failed", { contract: "canonical_chapter", ...validationLogFields(repairDiagnostics) });
+  return repairedNormalized;
+}
+
+function normalizeInitialGeneration(payload: InitialShape, diagnostics?: CanonicalValidationDiagnostics): { characters: StoryCharacter[]; chapter: StoryChapter; worldState: string } | null {
+  if (!Array.isArray(payload.characters) || !payload.chapter?.narration || !Array.isArray(payload.chapter.beats) || typeof payload.worldState !== "string") {
+    noteValidation(diagnostics, "invalid_initial_shape", { beatCount: Array.isArray(payload.chapter?.beats) ? payload.chapter.beats.length : 0 });
+    return null;
+  }
+  const characters = normalizeAdditionalCharacters(payload.characters, []);
+  if (!characters || characters.length === 0) {
+    noteValidation(diagnostics, "invalid_initial_characters", { newCharacterCount: Array.isArray(payload.characters) ? payload.characters.length : 0 });
+    return null;
+  }
+  const chapter = normalizeChapter(payload.chapter, 1, undefined, 1, diagnostics);
+  return chapter ? { characters, chapter, worldState: payload.worldState } : null;
+}
 
 export async function generateInitialStory(world: World): Promise<WorldStory> {
-  const payload = await modelJson<InitialShape>(
-    `You are StoryVerse's long-form fiction engine. ${originalGuard} Write a cinematic, anime-inspired but culturally respectful chapter. Make the cast visually distinct and keep their visual descriptions stable across future chapters. Set audioDirection from the chapter's actual emotional context: select the primary and secondary emotion, intensity 0–1, local BGM cue, and a concise narration delivery. No markdown.`,
-    `World title: ${world.title}\nGenre: ${world.genre}\nCore premise: ${world.premise}\nCreative direction: ${world.creatorPrompt}\nWrite Chapter 1 and an original persistent cast appropriate to this world. The cast has no fixed size: include every character the opening genuinely needs, and make each one fully specified for later point-of-view chapters.`, schema,
-  );
-  if (!payload || !Array.isArray(payload.characters) || !payload.chapter?.narration || !Array.isArray(payload.chapter.beats)) return emptyStory(world.id);
+  const request: CanonicalRequest = {
+    instructions: `You are StoryVerse's long-form fiction engine. ${originalGuard} Write a cinematic, anime-inspired but culturally respectful chapter. Make the cast visually distinct and keep their visual descriptions stable across future chapters. Set audioDirection from the chapter's actual emotional context: select the primary and secondary emotion, intensity 0–1, local BGM cue, and a concise narration delivery. ${transitionInstruction} No markdown.`,
+    input: `World title: ${world.title}\nGenre: ${world.genre}\nCore premise: ${world.premise}\nCreative direction: ${world.creatorPrompt}\nWrite Chapter 1 and an original persistent cast appropriate to this world. The cast has no fixed size: include every character the opening genuinely needs, and make each one fully specified for later point-of-view chapters.`,
+    responseSchema: schema,
+  };
+  const generated = await normalizeCanonicalWithRepair(await modelJson<InitialShape>(request.instructions, request.input, request.responseSchema), normalizeInitialGeneration, request);
+  if (!generated) return emptyStory(world.id);
   const time = now();
-  const characters = normalizeAdditionalCharacters(payload.characters, []);
-  if (!characters || characters.length === 0) return emptyStory(world.id);
-  const chapter = normalizeChapter(payload.chapter, 1);
-  return { worldId: world.id, characters: tagCharacterOrigins(characters, chapter.id), chapters: [chapter], perspectives: [], upcomingDirections: [], worldState: payload.worldState, source: "openai", createdAt: time, updatedAt: time };
+  return { worldId: world.id, characters: tagCharacterOrigins(generated.characters, generated.chapter.id), chapters: [generated.chapter], perspectives: [], upcomingDirections: [], worldState: generated.worldState, source: "openai", createdAt: time, updatedAt: time };
 }
 
 type NextChapterPayload = StoryChapter & { newCharacters?: unknown };
 
-function nextChapterRequest(world: World, story: WorldStory, command?: string): { previous: StoryChapter; directions: string[]; instructions: string; input: string } | null {
+function nextChapterRequest(world: World, story: WorldStory, command?: string): { previous: StoryChapter; directions: string[]; request: CanonicalRequest } | null {
   const previous = story.chapters.at(-1);
   if (!previous || story.characters.length === 0) return null;
   const directions = normalizedDirections(story.upcomingDirections);
   return {
     previous,
     directions,
-    instructions: `You continue an original StoryVerse serial. ${originalGuard} Preserve every existing character's visual description, personality, goal, and memories. Advance exactly one chapter with three to four imageable beats. Set audioDirection from the new chapter's actual emotional context: select the primary and secondary emotion, intensity 0–1, local BGM cue, and a concise narration delivery. Return newCharacters as an array of fully specified characters. There is no fixed maximum cast size: a queued direction may introduce any number of new characters when the story requires it. Add a new character only when the queued directions clearly justify it; otherwise return an empty array. If a queued direction requests named or new characters, introduce every requested character in the chapter prose and include a complete matching entry in newCharacters; never merely mention an unpersisted new character.`,
-    input: `World: ${world.title}\nPremise: ${world.premise}\nWorld state: ${story.worldState}\nPersistent characters: ${JSON.stringify(story.characters)}\nPrevious chapter: ${previous.narration}\nQueued directions for this chapter: ${JSON.stringify(directions)}\nAuthor command: ${command ?? "Continue the central conflict naturally."}\nUse queued directions as story guidance, never print them as instructions. Write chapter ${previous.number + 1}.`,
+    request: {
+      instructions: `You continue an original StoryVerse serial. ${originalGuard} Preserve every existing character's visual description, personality, goal, and memories. Advance exactly one chapter with three to four imageable beats. Address or escalate the prior transition's nextChapterHook in an immediate beat early in this chapter and honor its carryForward facts. Then make this chapter complete on its own terms. Set audioDirection from the new chapter's actual emotional context: select the primary and secondary emotion, intensity 0–1, local BGM cue, and a concise narration delivery. ${transitionInstruction} Return newCharacters as an array of fully specified characters. There is no fixed maximum cast size: a queued direction may introduce any number of new characters when the story requires it. Add a new character only when the queued directions clearly justify it; otherwise return an empty array. If a queued direction requests named or new characters, introduce every requested character in the chapter prose and include a complete matching entry in newCharacters; never merely mention an unpersisted new character.`,
+      input: `World: ${world.title}\nPremise: ${world.premise}\nWorld state: ${story.worldState}\nPersistent characters: ${JSON.stringify(story.characters)}\nPrevious chapter: ${previous.narration}\nPrior chapter transition (compact continuity contract): ${JSON.stringify(previousChapterTransition(previous))}\nQueued directions for this chapter: ${JSON.stringify(directions)}\nAuthor command: ${command ?? "Continue the central conflict naturally."}\nUse queued directions as story guidance, never print them as instructions. Write chapter ${previous.number + 1}.`,
+      responseSchema: nextChapterSchema,
+    },
   };
 }
 
-function normalizeNextChapter(payload: NextChapterPayload, story: WorldStory, previous: StoryChapter, directions: string[], command?: string): NextChapterGeneration | null {
-  if (!payload?.narration || !Array.isArray(payload.beats)) return null;
-  const chapter = normalizeChapter(payload, previous.number + 1, command, 1);
+function normalizeNextChapter(payload: NextChapterPayload, story: WorldStory, previous: StoryChapter, directions: string[], command?: string, diagnostics?: CanonicalValidationDiagnostics): NextChapterGeneration | null {
+  if (!payload?.narration || !Array.isArray(payload.beats)) {
+    noteValidation(diagnostics, "invalid_next_chapter_shape", { beatCount: Array.isArray(payload?.beats) ? payload.beats.length : 0, directionCount: directions.length });
+    return null;
+  }
+  const chapter = normalizeChapter(payload, previous.number + 1, command, 1, diagnostics);
+  if (!chapter) return null;
   const newCharacters = normalizeAdditionalCharacters(payload.newCharacters ?? [], story.characters);
-  if (!newCharacters) return null;
+  if (!newCharacters) {
+    noteValidation(diagnostics, "invalid_new_characters", { newCharacterCount: Array.isArray(payload.newCharacters) ? payload.newCharacters.length : 0, directionCount: directions.length });
+    return null;
+  }
   // New cast members are permitted only as part of fulfilling a pending
   // direction; reject an unexpected expansion instead of silently dropping it.
-  if (directions.length === 0 && newCharacters.length > 0) return null;
+  if (directions.length === 0 && newCharacters.length > 0) {
+    noteValidation(diagnostics, "unexpected_new_characters", { newCharacterCount: newCharacters.length, directionCount: directions.length });
+    return null;
+  }
   return { chapter, newCharacters: tagCharacterOrigins(newCharacters, chapter.id) };
 }
 
 export async function generateNextChapter(world: World, story: WorldStory, command?: string): Promise<NextChapterGeneration | null> {
   const request = nextChapterRequest(world, story, command);
   if (!request) return null;
-  const payload = await modelJson<NextChapterPayload>(request.instructions, request.input, nextChapterSchema);
-  return payload ? normalizeNextChapter(payload, story, request.previous, request.directions, command) : null;
+  const normalize = (payload: NextChapterPayload, diagnostics?: CanonicalValidationDiagnostics) => normalizeNextChapter(payload, story, request.previous, request.directions, command, diagnostics);
+  return normalizeCanonicalWithRepair(await modelJson<NextChapterPayload>(request.request.instructions, request.request.input, request.request.responseSchema), normalize, request.request);
 }
 
 /** Stream a next chapter while keeping raw structured JSON on the server. */
@@ -308,32 +606,45 @@ export async function generateNextChapterStream(
 ): Promise<NextChapterGeneration | null> {
   const request = nextChapterRequest(world, story, command);
   if (!request) return null;
-  const payload = await modelJsonStream<NextChapterPayload>(request.instructions, request.input, nextChapterSchema, callbacks);
-  return payload ? normalizeNextChapter(payload, story, request.previous, request.directions, command) : null;
+  const normalize = (payload: NextChapterPayload, diagnostics?: CanonicalValidationDiagnostics) => normalizeNextChapter(payload, story, request.previous, request.directions, command, diagnostics);
+  return normalizeCanonicalWithRepair(await modelJsonStream<NextChapterPayload>(request.request.instructions, request.request.input, request.request.responseSchema, callbacks), normalize, request.request);
 }
 
-function revisionRequest(world: World, story: WorldStory, prompt: string): { current: StoryChapter; revision: number; instructions: string; input: string } | null {
+function revisionRequest(world: World, story: WorldStory, prompt: string): { current: StoryChapter; revision: number; request: CanonicalRequest } | null {
   const current = story.chapters.at(-1);
   if (!current || story.characters.length === 0) return null;
   const revision = normalizedRevision(current.revision) + 1;
   return {
     current,
     revision,
-    instructions: `You revise the latest canonical chapter of an original StoryVerse serial. ${originalGuard} Preserve every existing persistent character, including their visual descriptions, personalities, goals, memories, and established world continuity. Apply the revision request to this chapter only. If and only if the revision explicitly introduces new characters, introduce each one in the prose and return every one as a complete entry in newCharacters; there is no fixed maximum. Do not remove existing persistent characters or expose instructions in the prose. Return a replacement chapter with three to four imageable beats and audioDirection.`,
-    input: `World: ${world.title}\nPremise: ${world.premise}\nWorld state: ${story.worldState}\nPersistent characters: ${JSON.stringify(story.characters)}\nQueued future directions (do not consume them): ${JSON.stringify(normalizedDirections(story.upcomingDirections))}\nCurrent canonical chapter: ${JSON.stringify(current)}\nRevision request: ${prompt}\nRewrite chapter ${current.number} in place.`,
+    request: {
+      instructions: `You revise the latest canonical chapter of an original StoryVerse serial. ${originalGuard} Preserve every existing persistent character, including their visual descriptions, personalities, goals, memories, and established world continuity. Apply the revision request to this chapter only. If and only if the revision explicitly introduces new characters, introduce each one in the prose and return every one as a complete entry in newCharacters; there is no fixed maximum. Do not remove existing persistent characters or expose instructions in the prose. Return a replacement chapter with three to four imageable beats and audioDirection. ${transitionInstruction}`,
+      input: `World: ${world.title}\nPremise: ${world.premise}\nWorld state: ${story.worldState}\nPersistent characters: ${JSON.stringify(story.characters)}\nQueued future directions (do not consume them): ${JSON.stringify(normalizedDirections(story.upcomingDirections))}\nCurrent canonical chapter: ${JSON.stringify(current)}\nRevision request: ${prompt}\nRewrite chapter ${current.number} in place.`,
+      responseSchema: revisionChapterSchema,
+    },
   };
+}
+
+function normalizeRevisionChapter(payload: NextChapterPayload, story: WorldStory, current: StoryChapter, revision: number, diagnostics?: CanonicalValidationDiagnostics): ChapterRevisionGeneration | null {
+  if (!payload?.narration || !Array.isArray(payload.beats)) {
+    noteValidation(diagnostics, "invalid_revision_shape", { beatCount: Array.isArray(payload?.beats) ? payload.beats.length : 0 });
+    return null;
+  }
+  const newCharacters = normalizeAdditionalCharacters(payload.newCharacters ?? [], story.characters);
+  if (!newCharacters) {
+    noteValidation(diagnostics, "invalid_new_characters", { newCharacterCount: Array.isArray(payload.newCharacters) ? payload.newCharacters.length : 0 });
+    return null;
+  }
+  const chapter = normalizeChapter(payload, current.number, current.command, revision, diagnostics);
+  return chapter ? { chapter, newCharacters: tagCharacterOrigins(newCharacters, chapter.id) } : null;
 }
 
 /** Rewrite only the latest canonical chapter; callers persist the replacement atomically. */
 export async function reviseLatestChapter(world: World, story: WorldStory, prompt: string): Promise<ChapterRevisionGeneration | null> {
   const request = revisionRequest(world, story, prompt);
   if (!request) return null;
-  const payload = await modelJson<NextChapterPayload>(request.instructions, request.input, revisionChapterSchema);
-  if (!payload?.narration || !Array.isArray(payload.beats)) return null;
-  const newCharacters = normalizeAdditionalCharacters(payload.newCharacters ?? [], story.characters);
-  if (!newCharacters) return null;
-  const chapter = normalizeChapter(payload, request.current.number, request.current.command, request.revision);
-  return { chapter, newCharacters: tagCharacterOrigins(newCharacters, chapter.id) };
+  const normalize = (payload: NextChapterPayload, diagnostics?: CanonicalValidationDiagnostics) => normalizeRevisionChapter(payload, story, request.current, request.revision, diagnostics);
+  return normalizeCanonicalWithRepair(await modelJson<NextChapterPayload>(request.request.instructions, request.request.input, request.request.responseSchema), normalize, request.request);
 }
 
 /** Stream a revision while keeping raw structured JSON on the server. */
@@ -345,12 +656,8 @@ export async function reviseLatestChapterStream(
 ): Promise<ChapterRevisionGeneration | null> {
   const request = revisionRequest(world, story, prompt);
   if (!request) return null;
-  const payload = await modelJsonStream<NextChapterPayload>(request.instructions, request.input, revisionChapterSchema, callbacks);
-  if (!payload?.narration || !Array.isArray(payload.beats)) return null;
-  const newCharacters = normalizeAdditionalCharacters(payload.newCharacters ?? [], story.characters);
-  if (!newCharacters) return null;
-  const chapter = normalizeChapter(payload, request.current.number, request.current.command, request.revision);
-  return { chapter, newCharacters: tagCharacterOrigins(newCharacters, chapter.id) };
+  const normalize = (payload: NextChapterPayload, diagnostics?: CanonicalValidationDiagnostics) => normalizeRevisionChapter(payload, story, request.current, request.revision, diagnostics);
+  return normalizeCanonicalWithRepair(await modelJsonStream<NextChapterPayload>(request.request.instructions, request.request.input, request.request.responseSchema, callbacks), normalize, request.request);
 }
 
 export async function generatePerspective(world: World, story: WorldStory, characterId: string): Promise<Perspective | null> {

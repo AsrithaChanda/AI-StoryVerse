@@ -1,6 +1,7 @@
 import { Fragment, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { StoryBeat, StoryChapter, WorldStory } from "../api/story";
 import { addUpcomingDirection, bootstrapStory, deleteFutureChapters, deleteLatestChapter } from "../api/story";
+import { applyChapterDirection, proposeChapterDirection, type ChapterDirectorProposal } from "../api/story-director";
 import { streamCharacterPerspective, streamNextChapter, streamReviseChapter, type StoryGenerationStage as StoryGenerationPhase } from "../api/story-stream";
 import type { World } from "../api/worlds";
 import { ensureSceneImage, generateSceneImage, loadSceneImage, waitForSceneImage } from "../images/api";
@@ -10,12 +11,14 @@ import type { StoryImage } from "../images/contracts";
 import ChapterBgm from "./ChapterBgm";
 import ChapterNarration from "./ChapterNarration";
 import ChapterTimelineActions from "./ChapterTimelineActions";
+import AIStoryDirector from "./AIStoryDirector";
 import type { AudioPlan } from "../audio/chapter-audio";
 import SceneImage, { type SceneImageRequest } from "./SceneImage";
 import StoryAuthorControls from "./StoryAuthorControls";
 import StoryGenerationStage, { type StoryIllustrationProgress } from "./StoryGenerationStage";
 import WorldCast from "./WorldCast";
 import { buildStoryFlow } from "../story-layout";
+import "../styles/chapter-handoff.css";
 
 type IllustrationProgress = { number: number; completed: number; total: number };
 type PerspectiveLoading = { characterId: string; characterName: string };
@@ -161,6 +164,9 @@ export default function GeneratedWorldReader({ world, close }: { world: World; c
   const storyFlow = useMemo(() => buildStoryFlow(viewNarration, viewBeats), [viewNarration, viewBeats]);
   const openingCharacterName = streamingGeneration?.kind === "perspective" ? streamingGeneration.characterName : undefined;
   const showingPerspectiveDraft = streamingGeneration?.kind === "perspective" && streamingGeneration.narration.trim().length > 0;
+  // A handoff is canonical story metadata. Do not make it appear inside a
+  // character lens (including the short interval while that lens is opening).
+  const isCanonicalReading = !activeCharacter && !perspectiveLoading && !openingCharacterName;
   /**
    * Every visible frame and background job shares this cache-first resolver.
    * It deduplicates StrictMode/rerender callers, never POSTs after observing a
@@ -346,6 +352,56 @@ export default function GeneratedWorldReader({ world, close }: { world: World; c
     }
   };
 
+  /**
+   * The Director proposal is intentionally separate from the broader revision
+   * workflow. It observes only the selected canonical chapter, makes no write,
+   * and the server binds its returned proposal to this chapter/revision.
+   */
+  const proposeDirectorChange = async (prompt: string): Promise<ChapterDirectorProposal> => {
+    if (!story || !chapter || !isLatestChapter || activeCharacter) {
+      throw new Error("Return to the current canonical chapter before asking the AI Story Director for a preview.");
+    }
+    const result = await proposeChapterDirection(world.id, chapter.id, prompt);
+    return result.proposal;
+  };
+
+  /** Apply an already reviewed proposal. The Director API revalidates its base
+   * revision, then this reader uses the normal atomic visual-preparation path
+   * so stale illustrations and POVs cannot flash into the replacement. */
+  const applyDirectorChange = async (proposal: ChapterDirectorProposal): Promise<void> => {
+    if (!story || !chapter || !isLatestChapter || activeCharacter) {
+      throw new Error("Return to the current canonical chapter before applying a Director preview.");
+    }
+    const revision = chapter.revision ?? 1;
+    if (proposal.chapterId !== chapter.id || proposal.baseRevision !== revision) {
+      throw new Error("This Director preview belongs to an earlier version of the chapter. Preview it again.");
+    }
+    illustrationTask.current += 1;
+    setIllustrationProgress(null);
+    setBusy(true); setError(undefined); setAudioPlan(null);
+    setStreamingGeneration({ kind: "revision", number: chapter.number, narration: "", phase: "validating" });
+    try {
+      const result = await applyChapterDirection(world.id, chapter.id, proposal);
+      if (!result.chapter || result.chapter.id !== chapter.id) {
+        throw new Error("The AI Story Director did not return the revised current chapter.");
+      }
+      // The Director assigns a new revision and beat namespace. Clear old
+      // in-memory art before the cinematic reader reveals the new chapter.
+      setStoredImages({});
+      const taskId = ++illustrationTask.current;
+      if (!await prepareVisualBatch(result.chapter, "revision", taskId)) return;
+      setStory(result.story);
+      showNarratorChapter(result.chapter, true);
+    } catch (reason) {
+      const detail = reason instanceof Error ? reason.message : "The Director proposal could not be applied.";
+      setError(detail);
+      throw reason instanceof Error ? reason : new Error(detail);
+    } finally {
+      setStreamingGeneration((current) => current?.kind === "revision" ? null : current);
+      setBusy(false);
+    }
+  };
+
   const addDirection = async (direction: string) => {
     if (!story || busy || !isLatestChapter) return;
     setBusy(true); setError(undefined);
@@ -464,6 +520,14 @@ export default function GeneratedWorldReader({ world, close }: { world: World; c
                   </div>;
                 })}
               </Fragment>)}</div>
+              {isCanonicalReading && chapter.transition && <ChapterTransitionHandoff chapterNumber={chapter.number} transition={chapter.transition} />}
+              {isLatestChapter && !activeCharacter && <AIStoryDirector
+                key={`${chapter.id}-r${chapter.revision ?? 1}`}
+                currentChapter={chapter}
+                busy={busy || Boolean(illustrationProgress)}
+                onPropose={proposeDirectorChange}
+                onApply={applyDirectorChange}
+              />}
             </>}
             {isLatestChapter ? <StoryAuthorControls upcomingDirections={story.upcomingDirections ?? []} busy={busy || Boolean(illustrationProgress)} onReviseCurrent={(prompt) => void reviseCurrentChapter(prompt)} onAddDirection={(direction) => void addDirection(direction)} onGenerateNext={() => void advance()} /> : <div className="archive-note"><span>ARCHIVED CHAPTER</span><p>This chapter and its illustrations are preserved. Return to the latest chapter to continue the world’s timeline.</p><button type="button" onClick={() => showNarratorChapter(story.chapters.at(-1)!)}>Return to latest chapter →</button></div>}
             {error && <p className="story-error" role="status">{error}</p>}
@@ -484,4 +548,30 @@ function PerspectiveLoadingNotice({ characterName }: { characterName: string }) 
     <div><span>CHARACTER LENS · LOADING</span><b>Opening {characterName}&rsquo;s perspective…</b><p>The canonical chapter stays intact while we gather their memories, goals, and observations.</p></div>
     <div className="perspective-loading__meter" aria-hidden="true"><i /></div>
   </section>;
+}
+
+/**
+ * A low-weight closing beat between the finished chapter and author controls.
+ * It never repeats chapter prose or creates a new scene; it simply makes the
+ * resolved present and the next narrative thread legible to the reader.
+ */
+function ChapterTransitionHandoff({ chapterNumber, transition }: { chapterNumber: number; transition: NonNullable<StoryChapter["transition"]> }) {
+  const carryForward = transition.carryForward.filter((thread) => thread.trim().length > 0);
+
+  return <footer className="chapter-handoff" aria-label={`Chapter ${chapterNumber} closing handoff`}>
+    <div className="chapter-handoff__line" aria-hidden="true"><i /><span /></div>
+    <div className="chapter-handoff__resolved">
+      <p>CHAPTER {String(chapterNumber).padStart(2, "0")} · CLOSING BEAT</p>
+      <h2>{transition.resolvedBeat}</h2>
+    </div>
+    {transition.closingImage.trim() && <p className="chapter-handoff__frame"><span>CLOSING SHOT</span>{transition.closingImage}</p>}
+    <div className="chapter-handoff__hook">
+      <span>THE THREAD AHEAD</span>
+      <p>{transition.nextChapterHook}</p>
+    </div>
+    {carryForward.length > 0 && <div className="chapter-handoff__carry-forward">
+      <span>CARRY FORWARD</span>
+      <ul>{carryForward.map((thread, index) => <li key={`${index}-${thread}`}>{thread}</li>)}</ul>
+    </div>}
+  </footer>;
 }

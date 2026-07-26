@@ -9,7 +9,9 @@ No prewritten or seeded story universe is included. The archive starts empty and
 - Create an original world from a short creative brief.
 - Browse and reopen worlds in the persistent World Atlas.
 - Generate a Chapter 1 with a persistent, uncapped cast, chapter beats, and world state.
+- Finish every newly generated canonical chapter with a resolved immediate beat, a closing image, and a compact carry-forward hook that the next chapter receives as continuity context.
 - Revise the latest chapter in place with a natural-language prompt. The replacement keeps the same chapter number and continuity, clears stale character POVs, receives new visual/audio identities so older assets cannot be reused accidentally, and may introduce new persistent characters.
+- Use the **AI Story Director** to preview a structured, current-chapter-only edit before applying it. The Director receives only the displayed canonical chapter and its instruction; it cannot inspect or change the cast, world state, character memories, future directions, or any other chapter.
 - Remove the current chapter only when it is the latest chapter and a prior chapter exists; the reader returns to that prior chapter.
 - While viewing any earlier chapter, prune every later chapter in one confirmed action. The rollback removes deleted chapters' POVs, chapter-introduced cast members, and database image-cache records so a new future starts cleanly.
 - Queue multiple upcoming directions, including any number of character introductions. The queue is saved with the world, injected into the next chapter's model context, and cleared only after that chapter is successfully persisted. New characters returned by the structured generation are added to the persistent cast for later chapters and POVs.
@@ -34,9 +36,11 @@ Open the local Vite URL shown in the terminal. With no PostgreSQL configuration,
 Add `OPENAI_API_KEY` to `.env` to enable live world, chapter, perspective, image, and narration generation. Credentials remain server-side.
 
 - `OPENAI_MODEL` — structured world and chapter generation (configured for `gpt-5.6-luna`)
+- `STORYVERSE_STORY_MAX_OUTPUT_TOKENS` — output budget for a complete structured chapter and its closing handoff (default `6000`)
 - `OPENAI_IMAGE_MODEL` — image generation
 - `STORYVERSE_IMAGE_QUALITY` — optional `low`, `medium`, or `high` image quality (`low` prioritizes visual turnaround over detail)
 - `OPENAI_NARRATION_MODEL` — exact-text narration through `gpt-4o-mini-tts`
+- `STORYVERSE_DIRECTOR_TIMEOUT_MS` — optional bounded wait for the proposal-only AI Story Director pass (default `45000`)
 
 Without a key, creators can still save and browse world briefs. Live Chapter 1, perspective, illustration, and narration generation require the configured provider.
 
@@ -58,7 +62,9 @@ See [the deployment guide](docs/deployment.md) for local Docker PostgreSQL testi
 
 - `src/components/StoryExperience.tsx` — professional product home, use cases, World Atlas, and world-creation dialog.
 - `src/components/GeneratedWorldReader.tsx` — chapter reader, character perspective switcher, revision/direction/rollback controls, archive navigation, images, BGM, and narration controls.
-- `server/story-routes.ts` — chapter, perspective, revision, direction, and timeline-rollback APIs.
+- `src/components/AIStoryDirector.tsx` — isolated review-before-apply Director panel for the current canonical chapter.
+- `server/chapter-director.ts` — bounded structured-output Director agent with no world-aggregate context or write capability.
+- `server/story-routes.ts` — chapter, perspective, revision, Director proposal/apply, direction, and timeline-rollback APIs.
 - `server/persistence/` — PostgreSQL/Lakebase schema, migrations, optimistic concurrency, and the common local/remote store contract.
 - `server/storage/` — provider-neutral generated-media store with local filesystem and Databricks Unity Catalog Volume implementations.
 - `server/` — Express API, structured generation, safe Responses-API streaming, image pipeline, chapter-audio director, and runtime store selection.
@@ -82,6 +88,8 @@ StoryVerse currently supports linear, persistent chapter continuations per creat
 - `POST /api/worlds/:worldId/story/directions` — persist a 3–1000 character upcoming direction.
 - `POST /api/worlds/:worldId/story/next/stream` — generate the next chapter using the saved direction queue; successful output consumes the queue and saves any structured new cast members.
 - `POST /api/worlds/:worldId/story/revise/stream` — stream and save a replacement for the latest canonical chapter.
+- `POST /api/worlds/:worldId/story/chapters/:chapterId/director/propose` — generate a non-persistent, structured Director proposal for only the current canonical chapter.
+- `POST /api/worlds/:worldId/story/chapters/:chapterId/director/apply` — revalidate and atomically apply the reviewed proposal; stale proposals are rejected.
 - `DELETE /api/worlds/:worldId/story/chapters/:chapterId` — remove a latest non-initial chapter and return its prior surviving chapter.
 - `DELETE /api/worlds/:worldId/story/chapters/:chapterId/future` — retain the selected chapter and remove every later chapter.
 

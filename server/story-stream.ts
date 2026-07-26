@@ -126,9 +126,9 @@ export async function collectResponseOutputText(
   let sawTextDelta = false;
   for await (const message of readProviderSse(body)) {
     if (message.data === "[DONE]") break;
-    let payload: { type?: unknown; delta?: unknown };
+    let payload: { type?: unknown; delta?: unknown; status?: unknown; response?: { status?: unknown } };
     try {
-      payload = JSON.parse(message.data) as { type?: unknown; delta?: unknown };
+      payload = JSON.parse(message.data) as { type?: unknown; delta?: unknown; status?: unknown; response?: { status?: unknown } };
     } catch {
       return { ok: false, reason: "invalid_response" };
     }
@@ -140,7 +140,11 @@ export async function collectResponseOutputText(
       onTextDelta?.(payload.delta);
       continue;
     }
-    if (type === "error" || type === "response.failed") return { ok: false, reason: "provider_error" };
+    if (type === "error" || type === "response.failed" || type === "response.incomplete") return { ok: false, reason: "provider_error" };
+    if (type === "response.completed") {
+      const status = payload.response?.status ?? payload.status;
+      if (status !== undefined && status !== "completed") return { ok: false, reason: "provider_error" };
+    }
   }
   return sawTextDelta ? { ok: true, outputText } : { ok: false, reason: "invalid_response" };
 }
