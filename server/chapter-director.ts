@@ -78,7 +78,7 @@ const directorResponseSchema = {
           category: { type: "string", enum: DIRECTOR_CATEGORIES },
           summary: { type: "string", minLength: 3, maxLength: 420 },
           rationale: { type: "string", minLength: 3, maxLength: 420 },
-          affectedBeatIds: { type: "array", minItems: 1, maxItems: 8, uniqueItems: true, items: { type: "string", minLength: 1, maxLength: 160 } },
+          affectedBeatIds: { type: "array", minItems: 1, maxItems: 8, items: { type: "string", minLength: 1, maxLength: 160 } },
         },
       },
     },

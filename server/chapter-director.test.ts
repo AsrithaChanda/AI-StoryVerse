@@ -88,6 +88,7 @@ describe("chapter director", () => {
     expect(request.instructions).toContain("clear, natural Indian English");
     expect(request.instructions).toContain("seven to ten small paragraphs");
     expect(request.responseSchema).toMatchObject({ type: "object", additionalProperties: false, required: ["directorIntent", "changes", "proposedChapter"] });
+    expect(JSON.stringify(request.responseSchema)).not.toContain("\"uniqueItems\"");
     expect((request.responseSchema as { properties: { proposedChapter: { properties: Record<string, unknown> } } }).properties.proposedChapter.properties).not.toHaveProperty("id");
   });
 
