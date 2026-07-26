@@ -87,6 +87,30 @@ export const POSTGRES_SCHEMA_MIGRATIONS = [
       "CREATE INDEX IF NOT EXISTS story_trailers_kind_lookup_idx ON story_trailers(world_id, chapter_id, chapter_revision, kind, updated_at DESC)",
     ],
   },
+  {
+    id: "004_time_machine_jobs",
+    statements: [
+      `CREATE TABLE IF NOT EXISTS time_machine_jobs (
+        id TEXT PRIMARY KEY,
+        world_id TEXT NOT NULL REFERENCES worlds(id) ON DELETE CASCADE,
+        target_chapter_id TEXT NOT NULL,
+        target_chapter_number INTEGER NOT NULL CHECK (target_chapter_number >= 1),
+        change_prompt TEXT NOT NULL,
+        future_prompt TEXT,
+        base_story_version BIGINT NOT NULL CHECK (base_story_version >= 0),
+        base_story_updated_at TIMESTAMPTZ NOT NULL,
+        total_chapters INTEGER NOT NULL CHECK (total_chapters >= 1),
+        completed_chapters INTEGER NOT NULL DEFAULT 0 CHECK (completed_chapters >= 0),
+        status TEXT NOT NULL CHECK (status IN ('queued', 'running', 'illustrating', 'completed', 'failed')),
+        progress INTEGER NOT NULL DEFAULT 0 CHECK (progress >= 0 AND progress <= 100),
+        error_code TEXT,
+        created_at TIMESTAMPTZ NOT NULL,
+        updated_at TIMESTAMPTZ NOT NULL
+      )`,
+      "CREATE INDEX IF NOT EXISTS time_machine_jobs_world_idx ON time_machine_jobs(world_id, created_at DESC)",
+      "CREATE UNIQUE INDEX IF NOT EXISTS time_machine_jobs_one_active_world_idx ON time_machine_jobs(world_id) WHERE status IN ('queued', 'running', 'illustrating')",
+    ],
+  },
 ] as const;
 
 export const POSTGRES_MIGRATIONS_TABLE = "storyverse_schema_migrations";

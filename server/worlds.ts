@@ -7,6 +7,10 @@ import type {
   StoryTrailerRetryReservation,
   StoryTrailerKind,
   StoryTrailerStatus,
+  NewTimeMachineJob,
+  StoredTimeMachineJob,
+  TimeMachineJobReservation,
+  TimeMachineJobStatus,
 } from "./persistence/store.js";
 import { MAX_UPCOMING_DIRECTIONS, type StoryChapter, type WorldStory } from "./story.js";
 
@@ -104,6 +108,25 @@ export class WorldStore {
     db.exec("CREATE INDEX IF NOT EXISTS story_trailers_lookup_idx ON story_trailers(world_id, chapter_id, chapter_revision, updated_at DESC)");
     db.exec("CREATE INDEX IF NOT EXISTS story_trailers_kind_lookup_idx ON story_trailers(world_id, chapter_id, chapter_revision, kind, updated_at DESC)");
     db.exec("CREATE INDEX IF NOT EXISTS story_trailers_status_idx ON story_trailers(status, updated_at DESC)");
+    db.exec(`CREATE TABLE IF NOT EXISTS time_machine_jobs (
+      id TEXT PRIMARY KEY,
+      world_id TEXT NOT NULL,
+      target_chapter_id TEXT NOT NULL,
+      target_chapter_number INTEGER NOT NULL,
+      change_prompt TEXT NOT NULL,
+      future_prompt TEXT,
+      base_story_version INTEGER NOT NULL,
+      base_story_updated_at TEXT NOT NULL,
+      total_chapters INTEGER NOT NULL,
+      completed_chapters INTEGER NOT NULL DEFAULT 0,
+      status TEXT NOT NULL,
+      progress INTEGER NOT NULL DEFAULT 0,
+      error_code TEXT,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL,
+      FOREIGN KEY(world_id) REFERENCES worlds(id)
+    )`);
+    db.exec("CREATE INDEX IF NOT EXISTS time_machine_jobs_world_idx ON time_machine_jobs(world_id, created_at DESC)");
     db.exec(`CREATE TABLE IF NOT EXISTS world_stories (
       world_id TEXT PRIMARY KEY,
       story_json TEXT NOT NULL,
@@ -145,6 +168,7 @@ export class WorldStore {
   private deleteWorldRecords(worldId: string): void {
     this.db.prepare("DELETE FROM story_images WHERE world_id = ?").run(worldId);
     this.db.prepare("DELETE FROM story_trailers WHERE world_id = ?").run(worldId);
+    this.db.prepare("DELETE FROM time_machine_jobs WHERE world_id = ?").run(worldId);
     this.db.prepare("DELETE FROM world_stories WHERE world_id = ?").run(worldId);
     this.db.prepare("DELETE FROM worlds WHERE id = ?").run(worldId);
   }
@@ -518,6 +542,67 @@ export class WorldStore {
     return trailer ? { trailer, requeued: result.changes > 0 } : null;
   }
 
+  public reserveTimeMachineJob(input: NewTimeMachineJob): TimeMachineJobReservation {
+    return this.inTransaction(() => {
+      const active = this.db.prepare(`SELECT * FROM time_machine_jobs
+        WHERE world_id = ? AND status IN ('queued', 'running', 'illustrating')
+        ORDER BY created_at DESC LIMIT 1`).get(input.worldId) as unknown as TimeMachineJobRow | undefined;
+      if (active) return { job: rowToTimeMachineJob(active), created: false };
+      const now = new Date().toISOString();
+      const job: StoredTimeMachineJob = {
+        id: randomUUID(), ...input, status: "queued", progress: 0,
+        completedChapters: 0, createdAt: now, updatedAt: now,
+      };
+      this.db.prepare(`INSERT INTO time_machine_jobs (
+        id, world_id, target_chapter_id, target_chapter_number, change_prompt,
+        future_prompt, base_story_version, base_story_updated_at, total_chapters,
+        completed_chapters, status, progress, error_code, created_at, updated_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(
+        job.id, job.worldId, job.targetChapterId, job.targetChapterNumber,
+        job.changePrompt, job.futurePrompt ?? null, job.baseStoryVersion,
+        job.baseStoryUpdatedAt, job.totalChapters, 0, job.status, 0, null, now, now,
+      );
+      return { job, created: true };
+    });
+  }
+
+  public getTimeMachineJob(jobId: string): StoredTimeMachineJob | null {
+    const row = this.db.prepare("SELECT * FROM time_machine_jobs WHERE id = ?").get(jobId) as unknown as TimeMachineJobRow | undefined;
+    return row ? rowToTimeMachineJob(row) : null;
+  }
+
+  public findLatestTimeMachineJob(worldId: string): StoredTimeMachineJob | null {
+    const row = this.db.prepare("SELECT * FROM time_machine_jobs WHERE world_id = ? ORDER BY created_at DESC LIMIT 1").get(worldId) as unknown as TimeMachineJobRow | undefined;
+    return row ? rowToTimeMachineJob(row) : null;
+  }
+
+  public claimTimeMachineJob(jobId: string): StoredTimeMachineJob | null {
+    this.db.prepare(`UPDATE time_machine_jobs SET status = 'running', progress = 2, updated_at = ?
+      WHERE id = ? AND status = 'queued'`).run(new Date().toISOString(), jobId);
+    return this.getTimeMachineJob(jobId);
+  }
+
+  public markTimeMachineJobProgress(jobId: string, status: "running" | "illustrating", progress: number, completedChapters: number): StoredTimeMachineJob | null {
+    this.db.prepare(`UPDATE time_machine_jobs SET status = ?, progress = ?, completed_chapters = ?, updated_at = ?
+      WHERE id = ? AND status IN ('running', 'illustrating')`).run(
+      status, clampProgress(progress), Math.max(0, Math.floor(completedChapters)), new Date().toISOString(), jobId,
+    );
+    return this.getTimeMachineJob(jobId);
+  }
+
+  public markTimeMachineJobCompleted(jobId: string): StoredTimeMachineJob | null {
+    this.db.prepare(`UPDATE time_machine_jobs SET status = 'completed', progress = 100,
+      completed_chapters = total_chapters, error_code = NULL, updated_at = ?
+      WHERE id = ? AND status IN ('running', 'illustrating')`).run(new Date().toISOString(), jobId);
+    return this.getTimeMachineJob(jobId);
+  }
+
+  public markTimeMachineJobFailed(jobId: string, errorCode: string): StoredTimeMachineJob | null {
+    this.db.prepare(`UPDATE time_machine_jobs SET status = 'failed', error_code = ?, updated_at = ?
+      WHERE id = ? AND status IN ('queued', 'running', 'illustrating')`).run(errorCode, new Date().toISOString(), jobId);
+    return this.getTimeMachineJob(jobId);
+  }
+
 }
 
 type StoryImageRow = {
@@ -535,6 +620,29 @@ type StoryTrailerRow = {
   provider: string | null; provider_job_id: string | null; provider_asset_id: string | null;
   error_code: string | null; retry_count: number; created_at: string; updated_at: string;
 };
+
+type TimeMachineJobRow = {
+  id: string; world_id: string; target_chapter_id: string; target_chapter_number: number;
+  change_prompt: string; future_prompt: string | null; base_story_version: number;
+  base_story_updated_at: string; total_chapters: number; completed_chapters: number;
+  status: TimeMachineJobStatus; progress: number; error_code: string | null;
+  created_at: string; updated_at: string;
+};
+
+function rowToTimeMachineJob(row: TimeMachineJobRow): StoredTimeMachineJob {
+  return {
+    id: row.id, worldId: row.world_id, targetChapterId: row.target_chapter_id,
+    targetChapterNumber: row.target_chapter_number, changePrompt: row.change_prompt,
+    futurePrompt: row.future_prompt ?? undefined, baseStoryVersion: row.base_story_version,
+    baseStoryUpdatedAt: row.base_story_updated_at, totalChapters: row.total_chapters,
+    completedChapters: row.completed_chapters, status: row.status, progress: row.progress,
+    errorCode: row.error_code ?? undefined, createdAt: row.created_at, updatedAt: row.updated_at,
+  };
+}
+
+function clampProgress(value: number): number {
+  return Math.max(0, Math.min(100, Math.round(value)));
+}
 
 
 /** Migrate old provider-supplied labels such as `beat_01` to stable,

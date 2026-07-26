@@ -14,6 +14,8 @@ import { createStoryTrailerRouter } from "./story-trailer-routes.js";
 import { createAssetStoreFromEnvironment } from "./storage/index.js";
 import { generateInitialStory } from "./story.js";
 import type { CreateWorldInput } from "./worlds.js";
+import { TimeMachineService } from "./time-machine.js";
+import { createTimeMachineRouter } from "./time-machine-routes.js";
 
 function validInput(value: unknown): value is CreateWorldInput {
   if (!value || typeof value !== "object") return false;
@@ -40,6 +42,7 @@ async function start(): Promise<void> {
   // configured Databricks backend uses one Volume with media namespaces.
   const imageAssets = assetBackend === "databricks-volume" ? new StoryImageAssetStore(assetStore) : new LocalImageAssetStore();
   const imagePipeline = createStoryImagePipeline(persistence.store, { assets: imageAssets });
+  const timeMachine = new TimeMachineService(persistence.store, imagePipeline);
   const app = express();
 
   app.use(express.json({ limit: "32kb" }));
@@ -82,6 +85,7 @@ async function start(): Promise<void> {
   app.use("/api", createImageRouter({ store: persistence.store, assets: imageAssets, pipeline: imagePipeline }));
   app.use("/api", createChapterAudioRouter(persistence.store, assetBackend === "databricks-volume" ? assetStore : undefined));
   app.use("/api", createStoryRouter(persistence.store));
+  app.use("/api", createTimeMachineRouter({ store: persistence.store, service: timeMachine }));
   app.use("/api", createStoryTrailerRouter({ store: persistence.store, assets: assetStore }));
 
   const builtApp = resolve(process.cwd(), "dist", "index.html");

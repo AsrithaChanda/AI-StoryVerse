@@ -103,6 +103,34 @@ export function toPublicStoryTrailer(trailer: StoredStoryTrailer): PublicStoryTr
   return publicTrailer;
 }
 
+export type TimeMachineJobStatus = "queued" | "running" | "illustrating" | "completed" | "failed";
+
+export type NewTimeMachineJob = {
+  worldId: string;
+  targetChapterId: string;
+  targetChapterNumber: number;
+  changePrompt: string;
+  futurePrompt?: string;
+  baseStoryVersion: number;
+  baseStoryUpdatedAt: string;
+  totalChapters: number;
+};
+
+export type StoredTimeMachineJob = NewTimeMachineJob & {
+  id: string;
+  status: TimeMachineJobStatus;
+  progress: number;
+  completedChapters: number;
+  errorCode?: string;
+  createdAt: string;
+  updatedAt: string;
+};
+
+export type TimeMachineJobReservation = {
+  job: StoredTimeMachineJob;
+  created: boolean;
+};
+
 /**
  * Shared persistence contract used by the HTTP layer. Every method permits a
  * Promise so the existing SQLite WorldStore remains a development fallback
@@ -173,6 +201,19 @@ export interface StoryStore {
   ): MaybePromise<StoredStoryTrailer | null>;
   markStoryTrailerFailed(cacheKey: string, errorCode: string): MaybePromise<StoredStoryTrailer | null>;
   requeueFailedStoryTrailer(cacheKey: string): MaybePromise<StoryTrailerRetryReservation | null>;
+
+  reserveTimeMachineJob(input: NewTimeMachineJob): MaybePromise<TimeMachineJobReservation>;
+  getTimeMachineJob(jobId: string): MaybePromise<StoredTimeMachineJob | null>;
+  findLatestTimeMachineJob(worldId: string): MaybePromise<StoredTimeMachineJob | null>;
+  claimTimeMachineJob(jobId: string): MaybePromise<StoredTimeMachineJob | null>;
+  markTimeMachineJobProgress(
+    jobId: string,
+    status: "running" | "illustrating",
+    progress: number,
+    completedChapters: number,
+  ): MaybePromise<StoredTimeMachineJob | null>;
+  markTimeMachineJobCompleted(jobId: string): MaybePromise<StoredTimeMachineJob | null>;
+  markTimeMachineJobFailed(jobId: string, errorCode: string): MaybePromise<StoredTimeMachineJob | null>;
 }
 
 /** Adds explicit version reads for request handlers that need CAS protection. */

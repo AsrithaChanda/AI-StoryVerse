@@ -4,6 +4,7 @@ import { addUpcomingDirection, bootstrapStory, deleteFutureChapters, deleteLates
 import { applyChapterDirection, proposeChapterDirection, type ChapterDirectorProposal } from "../api/story-director";
 import { streamCharacterPerspective, streamNextChapter, type StoryGenerationStage as StoryGenerationPhase } from "../api/story-stream";
 import type { World } from "../api/worlds";
+import type { TimeMachineJob } from "../api/time-machine";
 import { ensureSceneImage, generateSceneImage, loadSceneImage, waitForSceneImage } from "../images/api";
 import { preloadChapterImageAssets } from "../images/asset-preload";
 import { prepareChapterImageBatch, prepareChapterImages, type PreparedChapterImage } from "../images/chapter-preparation";
@@ -17,6 +18,7 @@ import SceneImage, { type SceneImageRequest } from "./SceneImage";
 import StoryAuthorControls from "./StoryAuthorControls";
 import StoryGenerationStage, { type StoryIllustrationProgress } from "./StoryGenerationStage";
 import StoryTrailer from "./StoryTrailer";
+import StoryTimeMachine from "./StoryTimeMachine";
 import WorldCast from "./WorldCast";
 import { buildStoryFlow } from "../story-layout";
 import "../styles/chapter-handoff.css";
@@ -94,6 +96,7 @@ export default function GeneratedWorldReader({ world, close }: { world: World; c
   const [perspectiveLoading, setPerspectiveLoading] = useState<PerspectiveLoading | null>(null);
   const [rollbackVersion, setRollbackVersion] = useState(0);
   const [bootstrapAttempt, setBootstrapAttempt] = useState(0);
+  const [timeMachineJob, setTimeMachineJob] = useState<TimeMachineJob | null>();
   const illustrationTask = useRef(0);
 
   useEffect(() => {
@@ -159,12 +162,17 @@ export default function GeneratedWorldReader({ world, close }: { world: World; c
   const chapter = story?.chapters.find((candidate) => candidate.id === selectedChapterId) ?? story?.chapters.at(-1);
   const chapterIndex = chapter && story ? story.chapters.findIndex((candidate) => candidate.id === chapter.id) : -1;
   const isLatestChapter = Boolean(story && chapterIndex === story.chapters.length - 1);
+  const timeMachineRunning = timeMachineJob?.status === "queued" || timeMachineJob?.status === "running" || timeMachineJob?.status === "illustrating";
+  const timeMachineStatusPending = timeMachineJob === undefined;
+  const chapterLocked = timeMachineStatusPending || Boolean(timeMachineRunning && chapter && chapter.number >= (timeMachineJob?.targetChapterNumber ?? Number.MAX_SAFE_INTEGER));
+  const readerBusy = busy || timeMachineStatusPending || timeMachineRunning;
   const chapterArtifactKey = chapter ? `${chapter.id}-r${chapter.revision ?? 1}` : "chapter";
   const moment = activeCharacter ? "perspective_scene" as const : "chapter_scene" as const;
   const readerLabel = useMemo(() => activeCharacter ? story?.characters.find((character) => character.id === activeCharacter)?.name ?? "Character" : "Narrator", [activeCharacter, story]);
   const storyFlow = useMemo(() => buildStoryFlow(viewNarration, viewBeats), [viewNarration, viewBeats]);
   const openingCharacterName = streamingGeneration?.kind === "perspective" ? streamingGeneration.characterName : undefined;
   const showingPerspectiveDraft = streamingGeneration?.kind === "perspective" && streamingGeneration.narration.trim().length > 0;
+
   // A handoff is canonical story metadata. Do not make it appear inside a
   // character lens (including the short interval while that lens is opening).
   const isCanonicalReading = !activeCharacter && !perspectiveLoading && !openingCharacterName;
@@ -211,8 +219,44 @@ export default function GeneratedWorldReader({ world, close }: { world: World; c
     if (latest) showNarratorChapter(latest, imagesPrepared);
   };
 
+  const timeMachineJobChanged = useCallback((job: TimeMachineJob | null) => {
+    setTimeMachineJob(job);
+    const active = job?.status === "queued" || job?.status === "running" || job?.status === "illustrating";
+    if (!active || !story) return;
+    const selected = story.chapters.find((candidate) => candidate.id === selectedChapterId) ?? story.chapters.at(-1);
+    if (!selected || selected.number < job.targetChapterNumber) return;
+    const safeChapter = story.chapters[job.targetChapterNumber - 2];
+    if (!safeChapter) return;
+    setSelectedChapterId(safeChapter.id);
+    setActiveCharacter(null);
+    setViewNarration(safeChapter.narration);
+    setViewBeats(safeChapter.beats);
+    setAudioPlan(null);
+  }, [selectedChapterId, story]);
+
+  const timeMachineCompleted = useCallback(async (job: TimeMachineJob) => {
+    try {
+      const { story: next } = await bootstrapStory(world.id);
+      const target = next.chapters.find((candidate) => candidate.number === job.targetChapterNumber) ?? next.chapters.at(-1);
+      illustrationTask.current += 1;
+      setStoredImages({});
+      setStory(next);
+      setActiveCharacter(null);
+      setAudioPlan(null);
+      if (target) {
+        setSelectedChapterId(target.id);
+        setViewNarration(target.narration);
+        setViewBeats(target.beats);
+        void loadStoredChapterImages(target);
+      }
+      setTimeMachineJob(job);
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : "The rewritten timeline could not be restored.");
+    }
+  }, [loadStoredChapterImages, world.id]);
+
   const chooseCharacter = async (characterId: string) => {
-    if (!story || busy || !isLatestChapter) return;
+    if (!story || readerBusy || !isLatestChapter) return;
     const character = story.characters.find((candidate) => candidate.id === characterId);
     if (!character) return;
     // Keep the current/canonical view visible until the character-specific
@@ -310,7 +354,7 @@ export default function GeneratedWorldReader({ world, close }: { world: World; c
   };
 
   const advance = async () => {
-    if (!story || busy || illustrationProgress || !isLatestChapter) return;
+    if (!story || readerBusy || illustrationProgress || !isLatestChapter) return;
     setBusy(true); setError(undefined);
     const requestedNumber = (story.chapters.at(-1)?.number ?? 0) + 1;
     setStreamingGeneration({ kind: "chapter", number: requestedNumber, narration: "", phase: "writing" });
@@ -379,7 +423,7 @@ export default function GeneratedWorldReader({ world, close }: { world: World; c
   };
 
   const addDirection = async (direction: string) => {
-    if (!story || busy || !isLatestChapter) return;
+    if (!story || readerBusy || !isLatestChapter) return;
     setBusy(true); setError(undefined);
     try {
       const result = await addUpcomingDirection(world.id, direction);
@@ -406,7 +450,7 @@ export default function GeneratedWorldReader({ world, close }: { world: World; c
   };
 
   const removeLatestChapter = async () => {
-    if (!story || !chapter || !isLatestChapter || chapterIndex <= 0 || busy || illustrationProgress) return;
+    if (!story || !chapter || !isLatestChapter || chapterIndex <= 0 || readerBusy || illustrationProgress) return;
     setBusy(true); setError(undefined); setAudioPlan(null);
     try {
       const result = await deleteLatestChapter(world.id, chapter.id);
@@ -420,7 +464,7 @@ export default function GeneratedWorldReader({ world, close }: { world: World; c
   };
 
   const removeFutureChapters = async () => {
-    if (!story || !chapter || chapterIndex < 0 || chapterIndex >= story.chapters.length - 1 || busy || illustrationProgress) return;
+    if (!story || !chapter || chapterIndex < 0 || chapterIndex >= story.chapters.length - 1 || readerBusy || illustrationProgress) return;
     setBusy(true); setError(undefined); setAudioPlan(null);
     try {
       const result = await deleteFutureChapters(world.id, chapter.id);
@@ -444,10 +488,22 @@ export default function GeneratedWorldReader({ world, close }: { world: World; c
       : streamingGeneration?.kind === "chapter" || streamingGeneration?.kind === "revision" ? <StoryGenerationStage kind={streamingGeneration.kind} number={streamingGeneration.number} narration={streamingGeneration.narration} phase={streamingGeneration.phase} illustration={streamingGeneration.illustration} />
         : busy && !story ? <div className="story-boot"><p className="eyebrow">STORY ENGINE</p><h1>Opening Chapter 1…</h1><p>Restoring the saved world, chapter, and visual sequence for {world.title}.</p></div>
           : story && chapter ? <div className="generated-grid"><section className="generated-story">
+            <StoryTimeMachine
+              worldId={world.id}
+              chapters={story.chapters}
+              disabled={busy || Boolean(illustrationProgress)}
+              onJobChange={timeMachineJobChanged}
+              onCompleted={timeMachineCompleted}
+            />
+            {chapterLocked ? <div className="timeline-locked" role="status">
+              <p>{timeMachineStatusPending ? "STORY TIME MACHINE · CHECKING TIMELINE" : `STORY TIME MACHINE · CHAPTER ${timeMachineJob?.targetChapterNumber} ONWARDS`}</p>
+              <h2>{timeMachineStatusPending ? "Restoring the saved timeline status…" : "This part of the timeline is being rewritten."}</h2>
+              <small>{timeMachineStatusPending ? "Your chapter will open after the current world status is confirmed." : "You can read the earlier chapters while the new future is generated and illustrated."}</small>
+            </div> : <>
             {story.chapters.length > 1 && <nav className="chapter-archive" aria-label="Chapter history">
               <button type="button" onClick={() => showNarratorChapter(story.chapters[chapterIndex - 1])} disabled={chapterIndex <= 0}>← Previous</button>
               <span>CHAPTER {chapter.number} OF {story.chapters.length}</span>
-              <button type="button" onClick={() => showNarratorChapter(story.chapters[chapterIndex + 1])} disabled={chapterIndex >= story.chapters.length - 1}>Next →</button>
+              <button type="button" onClick={() => showNarratorChapter(story.chapters[chapterIndex + 1])} disabled={chapterIndex >= story.chapters.length - 1 || Boolean(timeMachineRunning && story.chapters[chapterIndex + 1]?.number >= (timeMachineJob?.targetChapterNumber ?? Number.MAX_SAFE_INTEGER))}>Next →</button>
             </nav>}
             {/* A rollback changes the selected timeline. Remount the action
               surface once the request settles so a completed confirmation
@@ -458,7 +514,7 @@ export default function GeneratedWorldReader({ world, close }: { world: World; c
               isLatest={isLatestChapter}
               hasPreviousChapter={chapterIndex > 0}
               hasFutureChapters={chapterIndex >= 0 && chapterIndex < story.chapters.length - 1}
-              busy={busy || Boolean(illustrationProgress)}
+              busy={readerBusy || Boolean(illustrationProgress)}
               onDeleteCurrent={() => void removeLatestChapter()}
               onDeleteFuture={() => void removeFutureChapters()}
             />
@@ -500,7 +556,7 @@ export default function GeneratedWorldReader({ world, close }: { world: World; c
               {isLatestChapter && !activeCharacter && <AIStoryDirector
                 key={`${chapter.id}-r${chapter.revision ?? 1}`}
                 currentChapter={chapter}
-                busy={busy || Boolean(illustrationProgress)}
+                busy={readerBusy || Boolean(illustrationProgress)}
                 onPropose={proposeDirectorChange}
                 onApply={applyDirectorChange}
               />}
@@ -510,16 +566,17 @@ export default function GeneratedWorldReader({ world, close }: { world: World; c
                 chapterId={chapter.id}
                 chapterRevision={chapter.revision ?? 1}
                 chapterCount={chapterIndex + 1}
-                disabled={busy || Boolean(illustrationProgress)}
+                disabled={readerBusy || Boolean(illustrationProgress)}
               />}
             </>}
-            {isLatestChapter ? <StoryAuthorControls upcomingDirections={story.upcomingDirections ?? []} busy={busy || Boolean(illustrationProgress)} onAddDirection={(direction) => void addDirection(direction)} onGenerateNext={() => void advance()} /> : <div className="archive-note"><span>ARCHIVED CHAPTER</span><p>This chapter and its illustrations are preserved. Return to the latest chapter to continue the world’s timeline.</p><button type="button" onClick={() => showNarratorChapter(story.chapters.at(-1)!)}>Return to latest chapter →</button></div>}
+            {isLatestChapter ? <StoryAuthorControls upcomingDirections={story.upcomingDirections ?? []} busy={readerBusy || Boolean(illustrationProgress)} onAddDirection={(direction) => void addDirection(direction)} onGenerateNext={() => void advance()} /> : <div className="archive-note"><span>ARCHIVED CHAPTER</span><p>This chapter and its illustrations are preserved. Return to the latest chapter to continue the world’s timeline.</p><button type="button" onClick={() => showNarratorChapter(story.chapters.at(-1)!)}>Return to latest chapter →</button></div>}
+            </>}
             {error && <p className="story-error" role="status">{error}</p>}
           </section><WorldCast
             characters={story.characters}
             activeCharacterId={activeCharacter}
             loadingCharacterId={perspectiveLoading?.characterId}
-            disabled={busy || !isLatestChapter}
+            disabled={readerBusy || !isLatestChapter}
             onSelect={(characterId) => void chooseCharacter(characterId)}
           /></div>
             : <div className="story-boot"><p className="eyebrow">CHAPTER 1 IS NOT READY</p><h1>This world is waiting for its first scene.</h1><p>The story engine did not receive a usable chapter yet. Retry once the model connection is available; your world data is preserved.</p><button type="button" className="enter-button" onClick={retryBootstrap} disabled={busy}>{busy ? "Writing Chapter 1…" : "Generate Chapter 1 →"}</button>{error && <p className="story-error" role="status">{error}</p>}</div>}

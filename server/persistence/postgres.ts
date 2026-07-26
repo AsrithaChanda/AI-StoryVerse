@@ -26,6 +26,10 @@ import type {
   StoryWriteOptions,
   VersionedStoryStore,
   VersionedWorldStory,
+  NewTimeMachineJob,
+  StoredTimeMachineJob,
+  TimeMachineJobReservation,
+  TimeMachineJobStatus,
 } from "./store.js";
 
 /** Minimal pg-compatible surface. Keeping it structural lets unit tests use a fake pool. */
@@ -224,6 +228,24 @@ type StoryTrailerRow = Record<string, unknown> & {
   updated_at: string | Date;
 };
 
+type TimeMachineJobRow = Record<string, unknown> & {
+  id: string;
+  world_id: string;
+  target_chapter_id: string;
+  target_chapter_number: number | string;
+  change_prompt: string;
+  future_prompt: string | null;
+  base_story_version: number | string;
+  base_story_updated_at: string | Date;
+  total_chapters: number | string;
+  completed_chapters: number | string;
+  status: TimeMachineJobStatus;
+  progress: number | string;
+  error_code: string | null;
+  created_at: string | Date;
+  updated_at: string | Date;
+};
+
 function toIso(value: string | Date | undefined, fallback: string): string {
   if (value instanceof Date) return value.toISOString();
   if (typeof value === "string" && value.length > 0) return value;
@@ -299,6 +321,26 @@ function rowToStoryTrailer(row: StoryTrailerRow): StoredStoryTrailer {
     providerAssetId: row.provider_asset_id ?? undefined,
     errorCode: row.error_code ?? undefined,
     retryCount: Number(row.retry_count),
+    createdAt: toIso(row.created_at, new Date(0).toISOString()),
+    updatedAt: toIso(row.updated_at, new Date(0).toISOString()),
+  };
+}
+
+function rowToTimeMachineJob(row: TimeMachineJobRow): StoredTimeMachineJob {
+  return {
+    id: row.id,
+    worldId: row.world_id,
+    targetChapterId: row.target_chapter_id,
+    targetChapterNumber: Number(row.target_chapter_number),
+    changePrompt: row.change_prompt,
+    futurePrompt: row.future_prompt ?? undefined,
+    baseStoryVersion: Number(row.base_story_version),
+    baseStoryUpdatedAt: toIso(row.base_story_updated_at, new Date(0).toISOString()),
+    totalChapters: Number(row.total_chapters),
+    completedChapters: Number(row.completed_chapters),
+    status: row.status,
+    progress: Number(row.progress),
+    errorCode: row.error_code ?? undefined,
     createdAt: toIso(row.created_at, new Date(0).toISOString()),
     updatedAt: toIso(row.updated_at, new Date(0).toISOString()),
   };
@@ -988,6 +1030,82 @@ export class PostgresWorldStore implements VersionedStoryStore {
     // another provider call.
     const trailer = await this.getStoryTrailerByCacheKey(cacheKey);
     return trailer ? { trailer, requeued: false } : null;
+  }
+
+  public async reserveTimeMachineJob(input: NewTimeMachineJob): Promise<TimeMachineJobReservation> {
+    await this.ready();
+    const existing = await this.pool.query<TimeMachineJobRow>(`SELECT * FROM time_machine_jobs
+      WHERE world_id = $1 AND status IN ('queued', 'running', 'illustrating')
+      ORDER BY created_at DESC LIMIT 1`, [input.worldId]);
+    if (existing.rows[0]) return { job: rowToTimeMachineJob(existing.rows[0]), created: false };
+    const now = this.now().toISOString();
+    try {
+      const inserted = await this.pool.query<TimeMachineJobRow>(`INSERT INTO time_machine_jobs (
+        id, world_id, target_chapter_id, target_chapter_number, change_prompt,
+        future_prompt, base_story_version, base_story_updated_at, total_chapters,
+        completed_chapters, status, progress, created_at, updated_at
+      ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,0,'queued',0,$10,$10) RETURNING *`, [
+        this.createId(), input.worldId, input.targetChapterId, input.targetChapterNumber,
+        input.changePrompt, input.futurePrompt ?? null, input.baseStoryVersion,
+        input.baseStoryUpdatedAt, input.totalChapters, now,
+      ]);
+      return { job: rowToTimeMachineJob(inserted.rows[0]!), created: true };
+    } catch {
+      const raced = await this.pool.query<TimeMachineJobRow>(`SELECT * FROM time_machine_jobs
+        WHERE world_id = $1 AND status IN ('queued', 'running', 'illustrating')
+        ORDER BY created_at DESC LIMIT 1`, [input.worldId]);
+      if (!raced.rows[0]) throw new Error("Time Machine job reservation failed");
+      return { job: rowToTimeMachineJob(raced.rows[0]), created: false };
+    }
+  }
+
+  public async getTimeMachineJob(jobId: string): Promise<StoredTimeMachineJob | null> {
+    await this.ready();
+    const result = await this.pool.query<TimeMachineJobRow>("SELECT * FROM time_machine_jobs WHERE id = $1", [jobId]);
+    return result.rows[0] ? rowToTimeMachineJob(result.rows[0]) : null;
+  }
+
+  public async findLatestTimeMachineJob(worldId: string): Promise<StoredTimeMachineJob | null> {
+    await this.ready();
+    const result = await this.pool.query<TimeMachineJobRow>("SELECT * FROM time_machine_jobs WHERE world_id = $1 ORDER BY created_at DESC LIMIT 1", [worldId]);
+    return result.rows[0] ? rowToTimeMachineJob(result.rows[0]) : null;
+  }
+
+  public async claimTimeMachineJob(jobId: string): Promise<StoredTimeMachineJob | null> {
+    await this.ready();
+    const result = await this.pool.query<TimeMachineJobRow>(`UPDATE time_machine_jobs
+      SET status = 'running', progress = 2, updated_at = $2
+      WHERE id = $1 AND status = 'queued' RETURNING *`, [jobId, this.now().toISOString()]);
+    return result.rows[0] ? rowToTimeMachineJob(result.rows[0]) : this.getTimeMachineJob(jobId);
+  }
+
+  public async markTimeMachineJobProgress(jobId: string, status: "running" | "illustrating", progress: number, completedChapters: number): Promise<StoredTimeMachineJob | null> {
+    await this.ready();
+    const result = await this.pool.query<TimeMachineJobRow>(`UPDATE time_machine_jobs
+      SET status = $2, progress = $3, completed_chapters = $4, updated_at = $5
+      WHERE id = $1 AND status IN ('running', 'illustrating') RETURNING *`, [
+      jobId, status, normalizeTrailerProgress(progress, 0), Math.max(0, Math.floor(completedChapters)), this.now().toISOString(),
+    ]);
+    return result.rows[0] ? rowToTimeMachineJob(result.rows[0]) : this.getTimeMachineJob(jobId);
+  }
+
+  public async markTimeMachineJobCompleted(jobId: string): Promise<StoredTimeMachineJob | null> {
+    await this.ready();
+    const result = await this.pool.query<TimeMachineJobRow>(`UPDATE time_machine_jobs
+      SET status = 'completed', progress = 100, completed_chapters = total_chapters,
+        error_code = NULL, updated_at = $2
+      WHERE id = $1 AND status IN ('running', 'illustrating') RETURNING *`, [jobId, this.now().toISOString()]);
+    return result.rows[0] ? rowToTimeMachineJob(result.rows[0]) : this.getTimeMachineJob(jobId);
+  }
+
+  public async markTimeMachineJobFailed(jobId: string, errorCode: string): Promise<StoredTimeMachineJob | null> {
+    await this.ready();
+    const result = await this.pool.query<TimeMachineJobRow>(`UPDATE time_machine_jobs
+      SET status = 'failed', error_code = $2, updated_at = $3
+      WHERE id = $1 AND status IN ('queued', 'running', 'illustrating') RETURNING *`, [
+      jobId, errorCode, this.now().toISOString(),
+    ]);
+    return result.rows[0] ? rowToTimeMachineJob(result.rows[0]) : this.getTimeMachineJob(jobId);
   }
 
   private async updateStoryImage(sql: string, values: readonly unknown[]): Promise<StoredStoryImage | null> {

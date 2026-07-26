@@ -234,4 +234,33 @@ describe("world archive", () => {
     expect(store.findStoryTrailer(world.id, "chapter-1", 1, "story_so_far")).not.toBeNull();
     expect(store.findStoryTrailer(world.id, "chapter-2", 1, "story_so_far")).toBeNull();
   });
+
+  it("persists one active Time Machine job per world and records its progress", () => {
+    const store = new WorldStore(new DatabaseSync(":memory:"));
+    const world = createWorld(store, "Time Machine World");
+    const input = {
+      worldId: world.id,
+      targetChapterId: "chapter-2",
+      targetChapterNumber: 2,
+      changePrompt: "The hero chooses to tell the truth.",
+      futurePrompt: "Keep the family together while the mystery grows.",
+      baseStoryVersion: 0,
+      baseStoryUpdatedAt: "2026-07-26T10:00:00.000Z",
+      totalChapters: 3,
+    };
+    const first = store.reserveTimeMachineJob(input);
+    const duplicate = store.reserveTimeMachineJob({ ...input, changePrompt: "A competing rewrite." });
+    expect(first).toMatchObject({ created: true, job: { status: "queued", progress: 0 } });
+    expect(duplicate).toMatchObject({ created: false, job: { id: first.job.id } });
+
+    expect(store.claimTimeMachineJob(first.job.id)).toMatchObject({ status: "running", progress: 2 });
+    expect(store.markTimeMachineJobProgress(first.job.id, "illustrating", 84, 3))
+      .toMatchObject({ status: "illustrating", progress: 84, completedChapters: 3 });
+    expect(store.markTimeMachineJobCompleted(first.job.id))
+      .toMatchObject({ status: "completed", progress: 100, completedChapters: 3 });
+    expect(store.findLatestTimeMachineJob(world.id)).toMatchObject({ id: first.job.id, status: "completed" });
+
+    expect(store.reserveTimeMachineJob({ ...input, changePrompt: "A later rewrite." }))
+      .toMatchObject({ created: true, job: { status: "queued" } });
+  });
 });
