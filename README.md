@@ -61,10 +61,10 @@ See [the deployment guide](docs/deployment.md) for local Docker PostgreSQL testi
 ## Architecture
 
 - `src/components/StoryExperience.tsx` — professional product home, use cases, World Atlas, and world-creation dialog.
-- `src/components/GeneratedWorldReader.tsx` — chapter reader, character perspective switcher, revision/direction/rollback controls, archive navigation, images, BGM, and narration controls.
+- `src/components/GeneratedWorldReader.tsx` — chapter reader, character perspective switcher, Director/direction/rollback controls, archive navigation, images, BGM, and narration controls.
 - `src/components/AIStoryDirector.tsx` — isolated review-before-apply Director panel for the current canonical chapter.
 - `server/chapter-director.ts` — bounded structured-output Director agent with no world-aggregate context or write capability.
-- `server/story-routes.ts` — chapter, perspective, revision, Director proposal/apply, direction, and timeline-rollback APIs.
+- `server/story-routes.ts` — chapter, perspective, Director proposal/apply, direction, and timeline-rollback APIs.
 - `server/persistence/` — PostgreSQL/Lakebase schema, migrations, optimistic concurrency, and the common local/remote store contract.
 - `server/storage/` — provider-neutral generated-media store with local filesystem and Databricks Unity Catalog Volume implementations.
 - `server/` — Express API, structured generation, safe Responses-API streaming, image pipeline, chapter-audio director, and runtime store selection.
@@ -81,16 +81,15 @@ npm run build
 
 ## Current scope
 
-StoryVerse currently supports linear, persistent chapter continuations per created world. PostgreSQL keeps the current canonical story aggregate versioned and media records branch-scoped, so concurrent edits cannot silently overwrite one another and generated media remains continuity-safe. For product scope, arbitrary reader-visible branching/merging is still intentionally outside this build; only the latest chapter can be revised or deleted and any viewed chapter can prune later chapters. Authentication, payments, collaboration, and world sharing are also outside this build.
+StoryVerse currently supports linear, persistent chapter continuations per created world. PostgreSQL keeps the current canonical story aggregate versioned and media records branch-scoped, so concurrent edits cannot silently overwrite one another and generated media remains continuity-safe. For product scope, arbitrary reader-visible branching/merging is still intentionally outside this build; the AI Story Director can shape only the current canonical chapter, only the latest chapter can be deleted, and any viewed chapter can prune later chapters. Authentication, payments, collaboration, and world sharing are also outside this build.
 
 ## Authoring APIs
 
 - `POST /api/worlds/:worldId/story/directions` — persist a 3–1000 character upcoming direction.
 - `POST /api/worlds/:worldId/story/next/stream` — generate the next chapter using the saved direction queue; successful output consumes the queue and saves any structured new cast members.
-- `POST /api/worlds/:worldId/story/revise/stream` — stream and save a replacement for the latest canonical chapter.
 - `POST /api/worlds/:worldId/story/chapters/:chapterId/director/propose` — generate a non-persistent, structured Director proposal for only the current canonical chapter.
 - `POST /api/worlds/:worldId/story/chapters/:chapterId/director/apply` — revalidate and atomically apply the reviewed proposal; stale proposals are rejected.
 - `DELETE /api/worlds/:worldId/story/chapters/:chapterId` — remove a latest non-initial chapter and return its prior surviving chapter.
 - `DELETE /api/worlds/:worldId/story/chapters/:chapterId/future` — retain the selected chapter and remove every later chapter.
 
-The direction queue, revisions, and timeline rollback are stored inside the local SQLite record or the PostgreSQL story aggregate. PostgreSQL rollback locks the story row and deletes corresponding `story_images` metadata in the same transaction. No client-side-only state is relied on, so a refresh preserves the resulting timeline.
+The direction queue, Director-applied revisions, and timeline rollback are stored inside the local SQLite record or the PostgreSQL story aggregate. PostgreSQL rollback locks the story row and deletes corresponding `story_images` metadata in the same transaction. No client-side-only state is relied on, so a refresh preserves the resulting timeline.

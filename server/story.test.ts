@@ -1,6 +1,6 @@
 import { DatabaseSync } from "node:sqlite";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { generateInitialStory, generateNextChapter, reviseLatestChapter, type ChapterTransition, type WorldStory } from "./story.js";
+import { generateInitialStory, generateNextChapter, type ChapterTransition, type WorldStory } from "./story.js";
 import { WorldStore, type World } from "./worlds.js";
 
 function createTestWorld(store: WorldStore): World {
@@ -182,44 +182,6 @@ describe("persistent created-world stories", () => {
     expect(generated?.newCharacters).toHaveLength(5);
     expect(generated?.newCharacters.map((character) => character.id)).toEqual(["test-character-2", "test-character-3", "test-character-4", "test-character-5", "test-character-6"]);
     expect(generated?.chapter.id).toBe("chapter-2");
-  });
-
-  it("uses an unbounded new-character schema for revisions and returns every valid addition", async () => {
-    vi.stubEnv("OPENAI_API_KEY", "test-key");
-    const fetchMock = vi.fn(async (_input: RequestInfo | URL, _init?: RequestInit) => {
-      void _input;
-      void _init;
-      return new Response(JSON.stringify({ output_text: JSON.stringify({
-        id: "provider-revision", number: 99, title: "Revised Test Chapter", narration: completedNarration("B"), transition: generatedTransition("revision"),
-        beats: ["first", "second", "third"].map((caption) => ({ id: "beat_01", description: `${caption} revised test visual moment`, caption })),
-        audioDirection: { primaryEmotion: "suspense", secondaryEmotion: "reflection", intensity: 0.7, bgmCue: "suspense", narrationDelivery: "careful and immediate" },
-        newCharacters: [generatedCharacter(2), generatedCharacter(3), generatedCharacter(4)],
-      }) }));
-    });
-    vi.stubGlobal("fetch", fetchMock);
-    const store = new WorldStore(new DatabaseSync(":memory:"));
-    const world = createTestWorld(store);
-    const existing: WorldStory = {
-      worldId: world.id,
-      characters: [{ id: "test-character", name: "Test Character", role: "Test role", visualDescription: "Test coat", personality: "Steady", goal: "Reach the test gate", memories: [] }],
-      chapters: [{ id: "chapter-1", number: 1, revision: 1, title: "Test First Chapter", narration: "A".repeat(420), beats: [{ id: "chapter-1-beat-1", description: "The first test visual moment", caption: "first" }] }],
-      perspectives: [],
-      worldState: "The test gate remains closed while the test city waits for a signal.",
-      source: "openai",
-      createdAt: "2026-01-01T00:00:00.000Z",
-      updatedAt: "2026-01-01T00:00:00.000Z",
-    };
-
-    const generated = await reviseLatestChapter(world, existing, "Introduce three test characters while revising this scene.");
-    const request = fetchMock.mock.calls[0]?.[1];
-    if (!request) throw new Error("Expected the revision model request to include an init object");
-    const requestBody = JSON.parse(String(request.body)) as { text: { format: { schema: { required: string[]; properties: Record<string, Record<string, unknown>> } } } };
-
-    expect(requestBody.text.format.schema.required).toContain("newCharacters");
-    expect(requestBody.text.format.schema.required).toContain("transition");
-    expect(requestBody.text.format.schema.properties.newCharacters).not.toHaveProperty("maxItems");
-    expect(generated?.newCharacters.map((character) => character.id)).toEqual(["test-character-2", "test-character-3", "test-character-4"]);
-    expect(generated?.chapter).toMatchObject({ id: "chapter-1", number: 1, revision: 2 });
   });
 
   it("normalizes and persists the complete canonical chapter transition", async () => {

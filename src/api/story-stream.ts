@@ -10,7 +10,6 @@ export type StoryGenerationHandlers = {
 export type NextChapterStreamResult = { story: WorldStory; chapter?: StoryChapter };
 export type CommandStoryStreamResult = { story: WorldStory; chapter?: StoryChapter };
 export type CharacterPerspectiveStreamResult = { story: WorldStory; perspective?: Perspective };
-export type ReviseChapterStreamResult = { story: WorldStory; chapter: StoryChapter };
 
 type SseEvent = { name: string; data: string };
 
@@ -174,18 +173,6 @@ export function streamCharacterPerspective(
   return streamStoryGeneration<CharacterPerspectiveStreamResult>(
     `/api/worlds/${encodeURIComponent(worldId)}/story/perspective/stream`,
     { method: "POST", body: JSON.stringify({ characterId }) },
-    handlers,
-  );
-}
-
-export function streamReviseChapter(
-  worldId: string,
-  prompt: string,
-  handlers: StoryGenerationHandlers = {},
-): Promise<ReviseChapterStreamResult> {
-  return streamStoryGeneration<ReviseChapterStreamResult>(
-    `/api/worlds/${encodeURIComponent(worldId)}/story/revise/stream`,
-    { method: "POST", body: JSON.stringify({ prompt }) },
     handlers,
   );
 }

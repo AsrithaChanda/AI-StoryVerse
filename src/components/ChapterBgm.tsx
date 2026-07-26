@@ -2,9 +2,9 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { getAudioPlan, type AudioPlan } from "../audio/chapter-audio";
 import { AdaptiveSoundscape, soundscapeForChapter } from "../audio/soundscape";
 
-type Props = { worldId: string; chapterId: string; protagonistId?: string; chapterText: string; perspective: string; onPlan(plan: AudioPlan | null): void };
+type Props = { worldId: string; chapterId: string; protagonistId?: string; chapterText: string; onPlan(plan: AudioPlan | null): void };
 
-export default function ChapterBgm({ worldId, chapterId, protagonistId, chapterText, perspective, onPlan }: Props) {
+export default function ChapterBgm({ worldId, chapterId, protagonistId, chapterText, onPlan }: Props) {
   const engine = useRef<AdaptiveSoundscape | null>(null);
   const [playing, setPlaying] = useState(false);
   const [volume, setVolume] = useState(18);
@@ -40,8 +40,7 @@ export default function ChapterBgm({ worldId, chapterId, protagonistId, chapterT
   const updateVolume = (next: number) => { setVolume(next); engine.current?.setVolume(next / 100); if (player.current) player.current.volume = next / 100; };
 
   return <section className={`chapter-bgm chapter-bgm--${profile.mood}`} aria-label="Chapter background music">
-    <div><span>LOCAL EMOTION BGM {track ? `· ${track.title}` : "· selecting"}</span><b>{profile.label}</b><small>{perspective} · selected by the chapter audio director</small></div>
     <button type="button" onClick={() => void toggle()} aria-pressed={playing}>{playing ? "Pause music" : "Play music"}</button>
-    <label>Volume<input type="range" min="0" max="35" value={volume} onChange={(event) => updateVolume(Number(event.target.value))} /></label>
+    <input className="chapter-bgm__volume" type="range" min="0" max="35" value={volume} onChange={(event) => updateVolume(Number(event.target.value))} aria-label="Background music volume" />
   </section>;
 }

@@ -12,9 +12,6 @@ import {
   generatePerspective,
   generatePerspectiveStream,
   MAX_UPCOMING_DIRECTIONS,
-  reviseLatestChapter,
-  reviseLatestChapterStream,
-  type ChapterRevisionGeneration,
   type NextChapterGeneration,
   type StoryChapter,
   type StoryStreamCallbacks,
@@ -28,7 +25,6 @@ const id = z.string().trim().min(1).max(64).regex(/^[a-z0-9_-]+$/i);
 const commandSchema = z.object({ command: z.string().trim().min(3).max(1000) }).strict();
 const characterSchema = z.object({ characterId: id }).strict();
 const directionSchema = z.object({ direction: z.string().trim().min(3).max(1000) }).strict();
-const revisionSchema = z.object({ prompt: z.string().trim().min(3).max(1000) }).strict();
 const directorPromptSchema = z.object({ prompt: z.string().trim().min(3).max(600) }).strict();
 const directorApplySchema = z.object({ proposal: z.unknown() }).strict();
 
@@ -139,20 +135,6 @@ function appendGeneratedChapter(existing: WorldStory, generated: NextChapterGene
     // Directions are a one-shot queue: they remain intact if generation or
     // persistence fails, then clear only in the successful saved result.
     upcomingDirections: [],
-  };
-}
-
-function replaceLatestChapter(existing: WorldStory, generated: ChapterRevisionGeneration): WorldStory | null {
-  const current = existing.chapters.at(-1);
-  const { chapter } = generated;
-  if (!current || current.id !== chapter.id || current.number !== chapter.number) return null;
-  return {
-    ...existing,
-    characters: [...existing.characters, ...generated.newCharacters],
-    chapters: [...existing.chapters.slice(0, -1), chapter],
-    // Character views and their image beats describe the prior canonical
-    // text, so they must be regenerated after a revision.
-    perspectives: existing.perspectives.filter((entry) => entry.chapterId !== current.id),
   };
 }
 
@@ -288,43 +270,6 @@ export function createStoryRouter(store: StoryStore): Router {
     if (!story) return response.status(409).json({ error: "This chapter changed before the Director proposal could be applied. Preview it again." });
     const chapter = story.chapters.at(-1);
     return chapter ? response.json({ story, chapter }) : response.status(500).json({ error: "The Director change could not be saved" });
-  });
-
-  router.post("/worlds/:worldId/story/revise", async (request, response) => {
-    const parsed = revisionSchema.safeParse(request.body);
-    if (!parsed.success) return response.status(400).json({ error: "A 3–1000 character revision prompt is required" });
-    const world = await store.get(request.params.worldId);
-    if (!world) return response.status(404).json({ error: "World not found" });
-    const snapshot = await storySnapshot(store, world.id);
-    if (!snapshot) return response.status(409).json({ error: "Generate Chapter 1 first" });
-    const generated = await reviseLatestChapter(world, snapshot.story, parsed.data.prompt);
-    if (!generated) return response.status(503).json({ error: "The current chapter could not be revised" });
-    const updated = replaceLatestChapter(snapshot.story, generated);
-    if (!updated) return response.status(409).json({ error: "The current chapter changed before the revision could be saved" });
-    const story = await saveSnapshot(store, updated, snapshot);
-    return story ? response.json({ story, chapter: generated.chapter }) : response.status(409).json({ error: "The current chapter changed before the revision could be saved" });
-  });
-
-  router.post("/worlds/:worldId/story/revise/stream", async (request, response) => {
-    const parsed = revisionSchema.safeParse(request.body);
-    if (!parsed.success) return response.status(400).json({ error: "A 3–1000 character revision prompt is required" });
-    const world = await store.get(request.params.worldId);
-    if (!world) return response.status(404).json({ error: "World not found" });
-    const snapshot = await storySnapshot(store, world.id);
-    if (!snapshot) return response.status(409).json({ error: "Generate Chapter 1 first" });
-    beginSse(response);
-    writeSse(response, "phase", { stage: "writing" } satisfies StreamPhase);
-    const generated = await reviseLatestChapterStream(world, snapshot.story, parsed.data.prompt, storyStreamCallbacks(response));
-    if (!generated) return streamError(response, "The current chapter could not be revised");
-    const updated = replaceLatestChapter(snapshot.story, generated);
-    if (!updated) return streamError(response, "The current chapter changed before the revision could be saved");
-    try {
-      const story = await saveSnapshot(store, updated, snapshot);
-      if (!story) return streamError(response, "The current chapter changed before the revision could be saved");
-      return streamComplete(response, { story, chapter: generated.chapter });
-    } catch {
-      return streamError(response, "The current chapter could not be saved");
-    }
   });
 
   router.post("/worlds/:worldId/story/next", async (request, response) => {

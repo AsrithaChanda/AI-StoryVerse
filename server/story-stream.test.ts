@@ -578,87 +578,6 @@ describe("progressive story generation", () => {
     expect(store.getWorldStory(world.id)?.chapters).toHaveLength(1);
   });
 
-  it("atomically persists revision-introduced characters with the rewritten chapter and clears stale current perspectives", async () => {
-    vi.stubEnv("OPENAI_API_KEY", "test-key");
-    const store = new WorldStore(new DatabaseSync(":memory:"));
-    const world = createTestWorld(store);
-    const existing = existingStory(world.id);
-    existing.chapters[0] = { ...existing.chapters[0]!, revision: 1 };
-    existing.upcomingDirections = ["Keep the next chapter's test signal unresolved."];
-    existing.perspectives = [{
-      characterId: "test-character",
-      chapterId: "chapter-1",
-      narration: "The prior test perspective must be regenerated after revision.",
-      beats: [{ id: "chapter-1-test-character-beat-1", description: "The prior test view.", caption: "Prior view" }],
-    }];
-    store.saveWorldStory(existing);
-    const additions: NewCharacterPayload[] = [2, 3, 4].map((number) => ({
-      id: `revision-character-${number}`,
-      name: `Revision Character ${number}`,
-      role: `Revision role ${number}`,
-      visualDescription: `A distinct revision visual ${number}.`,
-      personality: `Revision trait ${number}.`,
-      goal: `Complete revision goal ${number}.`,
-      memories: [`Revision memory ${number}.`],
-    }));
-    vi.stubGlobal("fetch", vi.fn(async () => modelJsonResponse({
-      id: "provider-revision", number: 99, title: "Revised Test Opening", narration: `${"B".repeat(420)}.`,
-      beats: ["first", "second", "third"].map((caption) => ({ id: "beat_01", description: `${caption} revised test visual moment`, caption })),
-      audioDirection: { primaryEmotion: "suspense", secondaryEmotion: "reflection", intensity: 0.8, bgmCue: "suspense", narrationDelivery: "more immediate" },
-      transition: chapterTransition("Revised opening"),
-      newCharacters: additions,
-    })));
-    const recorder = jsonRecorder();
-
-    await postRoute(store, "/worlds/:worldId/story/revise")
-      .handle({ params: { worldId: world.id }, body: { prompt: "Make the current test scene more suspenseful." } }, recorder.response, () => undefined);
-
-    const payload = recorder.payload() as { story: WorldStory; chapter: StoryChapter };
-    const persisted = store.getWorldStory(world.id)!;
-    expect(recorder.status()).toBe(200);
-    expect(payload.chapter).toMatchObject({ id: "chapter-1", number: 1, revision: 2 });
-    expect(payload.chapter.beats.map((beat) => beat.id)).toEqual(["chapter-1-r2-beat-1", "chapter-1-r2-beat-2", "chapter-1-r2-beat-3"]);
-    expect(persisted.chapters[0]).toMatchObject({ id: "chapter-1", number: 1, revision: 2 });
-    expect(payload.story.characters).toHaveLength(1 + additions.length);
-    expect(persisted.characters.map((character) => character.id)).toEqual([
-      "test-character",
-      "revision-character-2",
-      "revision-character-3",
-      "revision-character-4",
-    ]);
-    expect(persisted.perspectives).toEqual([]);
-    expect(persisted.upcomingDirections).toEqual(["Keep the next chapter's test signal unresolved."]);
-  });
-
-  it.each([
-    ["malformed", [{ id: "malformed-character", name: "Malformed Character", role: "Role", visualDescription: "Visual", personality: "Trait", memories: ["Memory"] }]],
-    ["duplicate", [{ id: "test-character", name: "Duplicate Character", role: "Role", visualDescription: "Visual", personality: "Trait", goal: "Goal", memories: ["Memory"] }]],
-  ] as const)("does not partially mutate cast or chapter when revision additions are %s", async (_kind, newCharacters) => {
-    vi.stubEnv("OPENAI_API_KEY", "test-key");
-    const store = new WorldStore(new DatabaseSync(":memory:"));
-    const world = createTestWorld(store);
-    const existing = existingStory(world.id);
-    existing.chapters[0] = { ...existing.chapters[0]!, revision: 1 };
-    const before = store.saveWorldStory(existing);
-    vi.stubGlobal("fetch", vi.fn(async () => modelJsonResponse({
-      id: "provider-revision", number: 99, title: "Rejected Revision", narration: `${"B".repeat(420)}.`,
-      beats: ["first", "second", "third"].map((caption) => ({ id: "beat_01", description: `${caption} rejected test visual moment`, caption })),
-      audioDirection: { primaryEmotion: "suspense", secondaryEmotion: "reflection", intensity: 0.8, bgmCue: "suspense", narrationDelivery: "more immediate" },
-      transition: chapterTransition("Rejected revision"),
-      newCharacters,
-    })));
-    const recorder = jsonRecorder();
-
-    await postRoute(store, "/worlds/:worldId/story/revise")
-      .handle({ params: { worldId: world.id }, body: { prompt: "Attempt an invalid revision addition." } }, recorder.response, () => undefined);
-
-    const persisted = store.getWorldStory(world.id)!;
-    expect(recorder.status()).toBe(503);
-    expect(recorder.payload()).toEqual({ error: "The current chapter could not be revised" });
-    expect(persisted.characters).toEqual(before.characters);
-    expect(persisted.chapters).toEqual(before.chapters);
-  });
-
   it("guards delete-latest rollback against non-latest selection without mutating saved state", async () => {
     const store = new WorldStore(new DatabaseSync(":memory:"));
     const world = createTestWorld(store);
@@ -840,10 +759,11 @@ describe("progressive story generation", () => {
       "/worlds/:worldId/story/next/stream",
       "/worlds/:worldId/story/command/stream",
       "/worlds/:worldId/story/perspective/stream",
-      "/worlds/:worldId/story/revise/stream",
       "/worlds/:worldId/story/chapters/:chapterId/director/propose",
       "/worlds/:worldId/story/chapters/:chapterId/director/apply",
     ]));
+    expect(postPaths).not.toContain("/worlds/:worldId/story/revise");
+    expect(postPaths).not.toContain("/worlds/:worldId/story/revise/stream");
     expect(deletePaths).toEqual(expect.arrayContaining([
       "/worlds/:worldId/story/chapters/:chapterId",
       "/worlds/:worldId/story/chapters/:chapterId/future",

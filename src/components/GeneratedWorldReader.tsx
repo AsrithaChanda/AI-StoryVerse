@@ -2,7 +2,7 @@ import { Fragment, useCallback, useEffect, useMemo, useRef, useState } from "rea
 import type { StoryBeat, StoryChapter, WorldStory } from "../api/story";
 import { addUpcomingDirection, bootstrapStory, deleteFutureChapters, deleteLatestChapter } from "../api/story";
 import { applyChapterDirection, proposeChapterDirection, type ChapterDirectorProposal } from "../api/story-director";
-import { streamCharacterPerspective, streamNextChapter, streamReviseChapter, type StoryGenerationStage as StoryGenerationPhase } from "../api/story-stream";
+import { streamCharacterPerspective, streamNextChapter, type StoryGenerationStage as StoryGenerationPhase } from "../api/story-stream";
 import type { World } from "../api/worlds";
 import { ensureSceneImage, generateSceneImage, loadSceneImage, waitForSceneImage } from "../images/api";
 import { preloadChapterImageAssets } from "../images/asset-preload";
@@ -328,33 +328,8 @@ export default function GeneratedWorldReader({ world, close }: { world: World; c
     }
   };
 
-  const reviseCurrentChapter = async (prompt: string) => {
-    if (!story || !chapter || busy || illustrationProgress || !isLatestChapter) return;
-    illustrationTask.current += 1;
-    setIllustrationProgress(null);
-    setBusy(true); setError(undefined); setAudioPlan(null);
-    setStreamingGeneration({ kind: "revision", number: chapter.number, narration: "", phase: "writing" });
-    try {
-      const result = await streamReviseChapter(world.id, prompt, streamHandlers("revision"));
-      if (!result.chapter || result.chapter.id !== chapter.id) throw new Error("The story engine did not return a revision for this chapter.");
-      // A revision owns new visual beats. Clear the in-memory map so an old
-      // illustration can never briefly stand in for the new chapter.
-      setStoredImages({});
-      const taskId = ++illustrationTask.current;
-      if (!await prepareVisualBatch(result.chapter, "revision", taskId)) return;
-      setStory(result.story);
-      showNarratorChapter(result.chapter, true);
-    } catch (reason) {
-      setError(reason instanceof Error ? reason.message : "This chapter could not be revised.");
-    } finally {
-      setStreamingGeneration((current) => current?.kind === "revision" ? null : current);
-      setBusy(false);
-    }
-  };
-
   /**
-   * The Director proposal is intentionally separate from the broader revision
-   * workflow. It observes only the selected canonical chapter, makes no write,
+   * The Director observes only the selected canonical chapter, makes no write,
    * and the server binds its returned proposal to this chapter/revision.
    */
   const proposeDirectorChange = async (prompt: string): Promise<ChapterDirectorProposal> => {
@@ -496,7 +471,7 @@ export default function GeneratedWorldReader({ world, close }: { world: World; c
             </div>
             {perspectiveLoading && <PerspectiveLoadingNotice characterName={perspectiveLoading.characterName} />}
             {showingPerspectiveDraft && streamingGeneration ? <StoryGenerationStage kind="perspective" characterName={streamingGeneration.characterName} narration={streamingGeneration.narration} phase={streamingGeneration.phase} illustration={streamingGeneration.illustration} /> : <>
-              <ChapterBgm key={`bgm-${chapterArtifactKey}-${activeCharacter ?? "canonical"}`} worldId={world.id} chapterId={chapter.id} protagonistId={activeCharacter ?? undefined} chapterText={`${chapter.title}\n${viewNarration}`} perspective={activeCharacter ? `${readerLabel}'s POV` : "Canonical world view"} onPlan={setAudioPlan} />
+              <ChapterBgm key={`bgm-${chapterArtifactKey}-${activeCharacter ?? "canonical"}`} worldId={world.id} chapterId={chapter.id} protagonistId={activeCharacter ?? undefined} chapterText={`${chapter.title}\n${viewNarration}`} onPlan={setAudioPlan} />
               <ChapterNarration key={`narration-${chapterArtifactKey}-${activeCharacter ?? "canonical"}`} worldId={world.id} chapterId={chapter.id} protagonistId={activeCharacter ?? undefined} plan={audioPlan} />
               {illustrationProgress?.number === chapter.number && <div className="illustration-progress" role="status" aria-live="polite"><span>ILLUSTRATING IN BACKGROUND</span><b>{illustrationProgress.completed} of {illustrationProgress.total} chapter scenes saved</b><i><em style={{ width: `${(illustrationProgress.completed / Math.max(1, illustrationProgress.total)) * 100}%` }} /></i></div>}
               <div className="chapter-flow">{storyFlow.map((item, paragraphIndex) => <Fragment key={`${paragraphIndex}-${item.paragraph.slice(0, 32)}`}>
@@ -529,7 +504,7 @@ export default function GeneratedWorldReader({ world, close }: { world: World; c
                 onApply={applyDirectorChange}
               />}
             </>}
-            {isLatestChapter ? <StoryAuthorControls upcomingDirections={story.upcomingDirections ?? []} busy={busy || Boolean(illustrationProgress)} onReviseCurrent={(prompt) => void reviseCurrentChapter(prompt)} onAddDirection={(direction) => void addDirection(direction)} onGenerateNext={() => void advance()} /> : <div className="archive-note"><span>ARCHIVED CHAPTER</span><p>This chapter and its illustrations are preserved. Return to the latest chapter to continue the world’s timeline.</p><button type="button" onClick={() => showNarratorChapter(story.chapters.at(-1)!)}>Return to latest chapter →</button></div>}
+            {isLatestChapter ? <StoryAuthorControls upcomingDirections={story.upcomingDirections ?? []} busy={busy || Boolean(illustrationProgress)} onAddDirection={(direction) => void addDirection(direction)} onGenerateNext={() => void advance()} /> : <div className="archive-note"><span>ARCHIVED CHAPTER</span><p>This chapter and its illustrations are preserved. Return to the latest chapter to continue the world’s timeline.</p><button type="button" onClick={() => showNarratorChapter(story.chapters.at(-1)!)}>Return to latest chapter →</button></div>}
             {error && <p className="story-error" role="status">{error}</p>}
           </section><WorldCast
             characters={story.characters}

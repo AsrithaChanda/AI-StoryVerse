@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { streamCharacterPerspective, streamCommandStory, streamNextChapter, streamReviseChapter, streamStoryGeneration } from "./story-stream";
+import { streamCharacterPerspective, streamCommandStory, streamNextChapter, streamStoryGeneration } from "./story-stream";
 
 function sseResponse(chunks: string[], status = 200): Response {
   const encoder = new TextEncoder();
@@ -62,27 +62,23 @@ describe("story generation SSE transport", () => {
     await expect(streamStoryGeneration("/api/test-stream", { method: "POST" })).rejects.toThrow("World not found");
   });
 
-  it("parses a complete event when it is the final unterminated SSE record and builds wrapper paths", async () => {
+  it("parses a complete event when it is the final unterminated SSE record and builds active wrapper paths", async () => {
     const fetchMock = vi.fn()
       .mockResolvedValueOnce(sseResponse(["event: complete\ndata: {\"story\":{\"worldId\":\"one\"}}"] ))
       .mockResolvedValueOnce(sseResponse(["event: complete\ndata: {\"story\":{\"worldId\":\"two\"}}\n\n"]))
-      .mockResolvedValueOnce(sseResponse(["event: complete\ndata: {\"story\":{\"worldId\":\"three\"}}\n\n"]))
-      .mockResolvedValueOnce(sseResponse(["event: complete\ndata: {\"story\":{\"worldId\":\"four\"},\"chapter\":{\"id\":\"chapter-1\"}}\n\n"]));
+      .mockResolvedValueOnce(sseResponse(["event: complete\ndata: {\"story\":{\"worldId\":\"three\"}}\n\n"]));
     vi.stubGlobal("fetch", fetchMock);
 
     await expect(streamNextChapter("world / one")).resolves.toMatchObject({ story: { worldId: "one" } });
     await expect(streamCommandStory("world-two", "Continue.")).resolves.toMatchObject({ story: { worldId: "two" } });
     await expect(streamCharacterPerspective("world-three", "character-one")).resolves.toMatchObject({ story: { worldId: "three" } });
-    await expect(streamReviseChapter("world-four", "Make the test scene more suspenseful.")).resolves.toMatchObject({ story: { worldId: "four" }, chapter: { id: "chapter-1" } });
 
     expect(fetchMock.mock.calls.map(([path]) => path)).toEqual([
       "/api/worlds/world%20%2F%20one/story/next/stream",
       "/api/worlds/world-two/story/command/stream",
       "/api/worlds/world-three/story/perspective/stream",
-      "/api/worlds/world-four/story/revise/stream",
     ]);
     expect(JSON.parse(String(fetchMock.mock.calls[1]?.[1].body))).toEqual({ command: "Continue." });
     expect(JSON.parse(String(fetchMock.mock.calls[2]?.[1].body))).toEqual({ characterId: "character-one" });
-    expect(JSON.parse(String(fetchMock.mock.calls[3]?.[1].body))).toEqual({ prompt: "Make the test scene more suspenseful." });
   });
 });

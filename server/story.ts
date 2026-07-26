@@ -41,7 +41,6 @@ export type WorldStory = {
 };
 
 export type NextChapterGeneration = { chapter: StoryChapter; newCharacters: StoryCharacter[] };
-export type ChapterRevisionGeneration = { chapter: StoryChapter; newCharacters: StoryCharacter[] };
 
 /** Prevent a long-lived draft queue from inflating the next model context. */
 export const MAX_UPCOMING_DIRECTIONS = 12;
@@ -63,26 +62,11 @@ const schema = {
   },
 };
 
-const canonicalChapterSchema = {
-  type: "object", additionalProperties: false,
-  required: ["id", "number", "title", "narration", "beats", "audioDirection", "transition"],
-  properties: schema.properties.chapter.properties,
-};
-
 const nextChapterSchema = {
   type: "object", additionalProperties: false,
   required: ["id", "number", "title", "narration", "beats", "audioDirection", "transition", "newCharacters"],
   properties: {
     ...schema.properties.chapter.properties,
-    newCharacters: { type: "array", minItems: 0, items: schema.properties.characters.items },
-  },
-};
-
-const revisionChapterSchema = {
-  type: "object", additionalProperties: false,
-  required: ["id", "number", "title", "narration", "beats", "audioDirection", "transition", "newCharacters"],
-  properties: {
-    ...canonicalChapterSchema.properties,
     newCharacters: { type: "array", minItems: 0, items: schema.properties.characters.items },
   },
 };
@@ -607,56 +591,6 @@ export async function generateNextChapterStream(
   const request = nextChapterRequest(world, story, command);
   if (!request) return null;
   const normalize = (payload: NextChapterPayload, diagnostics?: CanonicalValidationDiagnostics) => normalizeNextChapter(payload, story, request.previous, request.directions, command, diagnostics);
-  return normalizeCanonicalWithRepair(await modelJsonStream<NextChapterPayload>(request.request.instructions, request.request.input, request.request.responseSchema, callbacks), normalize, request.request);
-}
-
-function revisionRequest(world: World, story: WorldStory, prompt: string): { current: StoryChapter; revision: number; request: CanonicalRequest } | null {
-  const current = story.chapters.at(-1);
-  if (!current || story.characters.length === 0) return null;
-  const revision = normalizedRevision(current.revision) + 1;
-  return {
-    current,
-    revision,
-    request: {
-      instructions: `You revise the latest canonical chapter of an original StoryVerse serial. ${originalGuard} Preserve every existing persistent character, including their visual descriptions, personalities, goals, memories, and established world continuity. Apply the revision request to this chapter only. If and only if the revision explicitly introduces new characters, introduce each one in the prose and return every one as a complete entry in newCharacters; there is no fixed maximum. Do not remove existing persistent characters or expose instructions in the prose. Return a replacement chapter with three to four imageable beats and audioDirection. ${transitionInstruction}`,
-      input: `World: ${world.title}\nPremise: ${world.premise}\nWorld state: ${story.worldState}\nPersistent characters: ${JSON.stringify(story.characters)}\nQueued future directions (do not consume them): ${JSON.stringify(normalizedDirections(story.upcomingDirections))}\nCurrent canonical chapter: ${JSON.stringify(current)}\nRevision request: ${prompt}\nRewrite chapter ${current.number} in place.`,
-      responseSchema: revisionChapterSchema,
-    },
-  };
-}
-
-function normalizeRevisionChapter(payload: NextChapterPayload, story: WorldStory, current: StoryChapter, revision: number, diagnostics?: CanonicalValidationDiagnostics): ChapterRevisionGeneration | null {
-  if (!payload?.narration || !Array.isArray(payload.beats)) {
-    noteValidation(diagnostics, "invalid_revision_shape", { beatCount: Array.isArray(payload?.beats) ? payload.beats.length : 0 });
-    return null;
-  }
-  const newCharacters = normalizeAdditionalCharacters(payload.newCharacters ?? [], story.characters);
-  if (!newCharacters) {
-    noteValidation(diagnostics, "invalid_new_characters", { newCharacterCount: Array.isArray(payload.newCharacters) ? payload.newCharacters.length : 0 });
-    return null;
-  }
-  const chapter = normalizeChapter(payload, current.number, current.command, revision, diagnostics);
-  return chapter ? { chapter, newCharacters: tagCharacterOrigins(newCharacters, chapter.id) } : null;
-}
-
-/** Rewrite only the latest canonical chapter; callers persist the replacement atomically. */
-export async function reviseLatestChapter(world: World, story: WorldStory, prompt: string): Promise<ChapterRevisionGeneration | null> {
-  const request = revisionRequest(world, story, prompt);
-  if (!request) return null;
-  const normalize = (payload: NextChapterPayload, diagnostics?: CanonicalValidationDiagnostics) => normalizeRevisionChapter(payload, story, request.current, request.revision, diagnostics);
-  return normalizeCanonicalWithRepair(await modelJson<NextChapterPayload>(request.request.instructions, request.request.input, request.request.responseSchema), normalize, request.request);
-}
-
-/** Stream a revision while keeping raw structured JSON on the server. */
-export async function reviseLatestChapterStream(
-  world: World,
-  story: WorldStory,
-  prompt: string,
-  callbacks: StoryStreamCallbacks,
-): Promise<ChapterRevisionGeneration | null> {
-  const request = revisionRequest(world, story, prompt);
-  if (!request) return null;
-  const normalize = (payload: NextChapterPayload, diagnostics?: CanonicalValidationDiagnostics) => normalizeRevisionChapter(payload, story, request.current, request.revision, diagnostics);
   return normalizeCanonicalWithRepair(await modelJsonStream<NextChapterPayload>(request.request.instructions, request.request.input, request.request.responseSchema, callbacks), normalize, request.request);
 }
 
