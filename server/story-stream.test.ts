@@ -291,6 +291,32 @@ describe("progressive story generation", () => {
     expect(store.getWorldStory(world.id)?.chapters).toHaveLength(2);
   });
 
+  it("does not append another chapter while a Time Machine rewrite owns the timeline", async () => {
+    vi.stubEnv("OPENAI_API_KEY", "test-key");
+    const fetchMock = vi.fn(async () => modelJsonResponse(nextPayload("A competing chapter should never be requested.")));
+    vi.stubGlobal("fetch", fetchMock);
+    const store = new WorldStore(new DatabaseSync(":memory:"));
+    const world = createTestWorld(store);
+    const saved = store.saveWorldStory(existingStory(world.id));
+    store.reserveTimeMachineJob({
+      worldId: world.id,
+      targetChapterId: "chapter-1",
+      targetChapterNumber: 1,
+      changePrompt: "Change the opening choice.",
+      baseStoryVersion: 0,
+      baseStoryUpdatedAt: saved.updatedAt,
+      totalChapters: 1,
+    });
+    const recorder = jsonRecorder();
+
+    await postRoute(store, "/worlds/:worldId/story/next")
+      .handle({ params: { worldId: world.id }, body: {} }, recorder.response, () => undefined);
+
+    expect(recorder.status()).toBe(423);
+    expect(fetchMock).not.toHaveBeenCalled();
+    expect(store.getWorldStory(world.id)?.chapters).toHaveLength(1);
+  });
+
   it("persists a non-streamed chapter ending and passes its compact handoff into the next generation", async () => {
     vi.stubEnv("OPENAI_API_KEY", "test-key");
     const firstTransition = chapterTransition("First ending");

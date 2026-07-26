@@ -115,7 +115,7 @@ export default function GeneratedWorldReader({ world, close }: { world: World; c
       setAudioPlan(null);
       setPerspectiveLoading(null);
       setIllustrationProgress(null);
-      setStreamingGeneration({ kind: "chapter", number: 1, narration: "", phase: "writing" });
+      setStreamingGeneration(null);
       try {
         const { story: next } = await bootstrapStory(world.id);
         if (!active) return;
@@ -491,7 +491,7 @@ export default function GeneratedWorldReader({ world, close }: { world: World; c
     <header className="reader-header"><button className="brand" type="button" onClick={close}><span className="mark">SV</span> WORLD ATLAS</button><span className="timeline-pill violet">{world.genre}</span></header>
     {error && !story ? <div className="story-boot"><h1>The chapter is waiting.</h1><p>{error}</p><button type="button" className="enter-button" onClick={retryBootstrap}>Try again</button></div>
       : streamingGeneration?.kind === "chapter" || streamingGeneration?.kind === "revision" ? <StoryGenerationStage kind={streamingGeneration.kind} number={streamingGeneration.number} narration={streamingGeneration.narration} phase={streamingGeneration.phase} illustration={streamingGeneration.illustration} />
-        : busy && !story ? <div className="story-boot"><p className="eyebrow">STORY ENGINE</p><h1>Opening Chapter 1…</h1><p>Restoring the saved world, chapter, and visual sequence for {world.title}.</p></div>
+        : busy && !story ? <div className="story-boot"><p className="eyebrow">WORLD ARCHIVE</p><h1>Restoring the saved story…</h1><p>Checking the timeline, chapters, and saved visual sequence for {world.title}.</p></div>
           : story && chapter ? <div className="generated-grid"><section className="generated-story">
             <StoryTimeMachine
               worldId={world.id}

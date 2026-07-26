@@ -90,9 +90,24 @@ async function storySnapshot(store: StoryStore, worldId: string): Promise<StoryS
   return story ? { story } : null;
 }
 
+async function timeMachineActive(store: StoryStore, worldId: string): Promise<boolean> {
+  const job = await store.findLatestTimeMachineJob(worldId);
+  return job?.status === "queued" || job?.status === "running" || job?.status === "illustrating";
+}
+
 async function saveSnapshot(store: StoryStore, story: WorldStory, snapshot: StorySnapshot | null): Promise<WorldStory | null> {
+  // The Time Machine owns the world version until its complete replacement is
+  // committed. This second, save-time check closes the race where another
+  // chapter request began just before the rewrite job was reserved.
+  if (await timeMachineActive(store, story.worldId)) return null;
   if (isVersionedStore(store)) return store.saveWorldStory(story, { expectedVersion: snapshot?.version ?? 0 });
   return store.saveWorldStory(story);
+}
+
+async function rejectWhileTimeMachineRuns(store: StoryStore, worldId: string, response: Response): Promise<boolean> {
+  if (!await timeMachineActive(store, worldId)) return false;
+  response.status(423).json({ error: "The Story Time Machine is rewriting this world. Wait for it to finish before changing the timeline." });
+  return true;
 }
 
 /**
@@ -180,6 +195,7 @@ export function createStoryRouter(store: StoryStore): Router {
     const chapterId = id.safeParse(request.params.chapterId);
     if (!worldId.success || !chapterId.success) return response.status(400).json({ error: "Invalid world or chapter identifier" });
     if (!await store.get(worldId.data)) return response.status(404).json({ error: "World not found" });
+    if (await rejectWhileTimeMachineRuns(store, worldId.data, response)) return;
     const result = await store.deleteFutureChapters(worldId.data, chapterId.data);
     if (!result.ok) return chapterDeletionError(response, result.reason);
     return response.json({ story: result.value.story, chapter: result.value.chapter });
@@ -190,6 +206,7 @@ export function createStoryRouter(store: StoryStore): Router {
     const chapterId = id.safeParse(request.params.chapterId);
     if (!worldId.success || !chapterId.success) return response.status(400).json({ error: "Invalid world or chapter identifier" });
     if (!await store.get(worldId.data)) return response.status(404).json({ error: "World not found" });
+    if (await rejectWhileTimeMachineRuns(store, worldId.data, response)) return;
     const result = await store.deleteLatestChapter(worldId.data, chapterId.data);
     if (!result.ok) return chapterDeletionError(response, result.reason);
     return response.json({ story: result.value.story, chapter: result.value.chapter });
@@ -275,6 +292,7 @@ export function createStoryRouter(store: StoryStore): Router {
   router.post("/worlds/:worldId/story/next", async (request, response) => {
     const world = await store.get(request.params.worldId);
     if (!world) return response.status(404).json({ error: "World not found" });
+    if (await rejectWhileTimeMachineRuns(store, world.id, response)) return;
     const snapshot = await storySnapshot(store, world.id);
     if (!snapshot) return response.status(409).json({ error: "Generate Chapter 1 first" });
     const generated = await safelyGenerateNextChapter(() => generateNextChapter(world, snapshot.story));
@@ -286,6 +304,7 @@ export function createStoryRouter(store: StoryStore): Router {
   router.post("/worlds/:worldId/story/next/stream", async (request, response) => {
     const world = await store.get(request.params.worldId);
     if (!world) return response.status(404).json({ error: "World not found" });
+    if (await rejectWhileTimeMachineRuns(store, world.id, response)) return;
     const snapshot = await storySnapshot(store, world.id);
     if (!snapshot) return response.status(409).json({ error: "Generate Chapter 1 first" });
     beginSse(response);
@@ -306,6 +325,7 @@ export function createStoryRouter(store: StoryStore): Router {
     if (!parsed.success) return response.status(400).json({ error: "A 3–1000 character story command is required" });
     const world = await store.get(request.params.worldId);
     if (!world) return response.status(404).json({ error: "World not found" });
+    if (await rejectWhileTimeMachineRuns(store, world.id, response)) return;
     const snapshot = await storySnapshot(store, world.id);
     if (!snapshot) return response.status(409).json({ error: "Generate Chapter 1 first" });
     const generated = await generateNextChapter(world, snapshot.story, parsed.data.command);
@@ -319,6 +339,7 @@ export function createStoryRouter(store: StoryStore): Router {
     if (!parsed.success) return response.status(400).json({ error: "A 3–1000 character story command is required" });
     const world = await store.get(request.params.worldId);
     if (!world) return response.status(404).json({ error: "World not found" });
+    if (await rejectWhileTimeMachineRuns(store, world.id, response)) return;
     const snapshot = await storySnapshot(store, world.id);
     if (!snapshot) return response.status(409).json({ error: "Generate Chapter 1 first" });
     beginSse(response);
